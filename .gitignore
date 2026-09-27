@@ -1,0 +1,8 @@
+# Secrets (API keys) — only .env.example is committed
+.env
+
+# Local environment and generated files
+.venv/
+output/
+__pycache__/
+*.pyc
