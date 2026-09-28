@@ -4,7 +4,7 @@ from pathlib import Path
 
 from core import catalog
 from core.config import RunStore
-from core.video_pipeline import render
+from core.video_pipeline import render, run_media
 
 
 def _year_badge(*texts: str) -> str:
@@ -63,8 +63,12 @@ def build_snapshot(state: dict, render_options: dict, music_file: str, tts_rate:
         "tts_rate": tts_rate,
         "resolution": render_options["resolution"],
         "template": render_options["template"],
+        "transition": render_options.get("transition", "template"),
+        "scene_timing": render_options.get("scene_timing", "even"),
+        "subtitle_style": render_options.get("subtitle_style", "normal"),
         "video_mode": "news_report",
         "asset_files": [scene["image"]["file"] for scene in scenes],
+        "scene_texts": [scene["text"] for scene in scenes],
         "music_file": music_file,
         "music_volume": render_options["music_volume"],
         "source_name": _source_label(scenes),
@@ -76,4 +80,27 @@ def build_snapshot(state: dict, render_options: dict, music_file: str, tts_rate:
 
 def render_video(store: RunStore, snapshot: dict, stage) -> Path:
     render(snapshot, store.render, store.directory, stage)
-    return store.render / "final.mp4"
+    video = store.render / "final.mp4"
+    make_thumbnail(video)
+    return video
+
+
+def make_thumbnail(video: Path) -> Path:
+    """Cover image for publishing: the frame at 0.5 s, i.e. the title card over scene 1."""
+    output = video.with_name("thumbnail.jpg")
+    run_media(["ffmpeg", "-y", "-nostdin", "-v", "error", "-ss", "0.5", "-i", video.name,
+               "-frames:v", "1", "-q:v", "2", output.name], video.parent, 60)
+    return output
+
+
+def export_video(video: Path, target: Path) -> list[Path]:
+    """Copy the MP4 with its subtitles and cover image next to it, all named after the chosen file."""
+    target = target.with_suffix(".mp4")
+    copies = [(video, target), (video.with_name("subtitles.srt"), target.with_suffix(".srt")),
+              (video.with_name("thumbnail.jpg"), target.with_suffix(".jpg"))]
+    written = []
+    for source, destination in copies:
+        if source.is_file():
+            shutil.copyfile(source, destination)
+            written.append(destination)
+    return written

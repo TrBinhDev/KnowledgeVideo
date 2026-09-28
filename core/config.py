@@ -10,7 +10,40 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 ROOT = Path(__file__).resolve().parents[1]
-load_dotenv(ROOT / ".env")
+ENV_FILE = ROOT / ".env"
+load_dotenv(ENV_FILE)
+
+
+def update_env(values: dict[str, str]) -> None:
+    """Write settings into .env, keeping comments and unrelated lines, and apply them to this process.
+
+    Values are single-line; ones with spaces or "#" are single-quoted, which python-dotenv reads literally.
+    """
+    clean = {}
+    for key, value in values.items():
+        value = " ".join(str(value or "").split())
+        if "'" in value:
+            raise ValueError(f"Giá trị của {key} không được chứa dấu nháy đơn.")
+        clean[key] = value
+
+    def line_for(key: str) -> str:
+        return f"{key}='{clean[key]}'" if re.search(r"[\s#]", clean[key]) else f"{key}={clean[key]}"
+
+    lines = ENV_FILE.read_text(encoding="utf-8").splitlines() if ENV_FILE.is_file() else []
+    remaining = set(clean)
+    output = []
+    for line in lines:
+        key = line.split("=", 1)[0].strip()
+        if "=" in line and not line.lstrip().startswith("#") and key in remaining:
+            output.append(line_for(key))
+            remaining.discard(key)
+        else:
+            output.append(line)
+    output += [line_for(key) for key in clean if key in remaining]
+    temporary = ENV_FILE.with_name(".env.tmp")
+    temporary.write_text("\n".join(output) + "\n", encoding="utf-8")
+    temporary.replace(ENV_FILE)
+    os.environ.update(clean)
 
 
 def output_directory() -> Path:
@@ -19,6 +52,20 @@ def output_directory() -> Path:
     directory = directory.resolve()
     directory.mkdir(parents=True, exist_ok=True)
     return directory
+
+
+def list_runs() -> list[tuple[Path, dict]]:
+    """Saved video runs, newest first (folder names start with the creation time)."""
+    runs = []
+    for directory in sorted(output_directory().iterdir(), reverse=True):
+        state_file = directory / "state.json"
+        if not directory.is_dir() or not state_file.is_file():
+            continue
+        try:
+            runs.append((directory, json.loads(state_file.read_text(encoding="utf-8"))))
+        except (OSError, ValueError):
+            continue
+    return runs
 
 
 def http_user_agent() -> str:

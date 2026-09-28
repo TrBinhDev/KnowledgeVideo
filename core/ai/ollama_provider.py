@@ -16,6 +16,9 @@ from core.ai.base import (
 logger = logging.getLogger("kv.ai.ollama")
 
 DEFAULT_MODEL = "gemma3"
+# Rough size (characters) beyond which the prompt needs a larger context window than the default.
+LONG_PROMPT_CHARS = 5000
+LONG_PROMPT_CONTEXT = 16384
 
 
 def _server_url() -> str:
@@ -65,6 +68,9 @@ class OllamaProvider(BaseAIProvider):
             "stream": False,
             "options": {"temperature": temperature},
         }
+        # Ollama's default context window is small and silently drops the start of long prompts (source documents).
+        if len(system_prompt) + len(user_prompt) > LONG_PROMPT_CHARS:
+            payload["options"]["num_ctx"] = LONG_PROMPT_CONTEXT
         request = Request(
             self._url,
             data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),

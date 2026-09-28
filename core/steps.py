@@ -1,3 +1,4 @@
+import json
 import logging
 import re
 
@@ -61,10 +62,13 @@ def parse_outline_text(text: str, total: int) -> list[dict]:
     return [{"text": content, "seconds": value} for (_, content), value in zip(parsed, seconds)]
 
 
-def make_outline(provider: BaseAIProvider, content_type: str, category: str, topic: str, duration_seconds: int) -> dict:
+def make_outline(provider: BaseAIProvider, content_type: str, category: str, topic: str, duration_seconds: int,
+                 point_count: int | None = None, style: str | None = None, source: str = "") -> dict:
+    """`point_count` None derives it from the duration; `source` restricts facts to that document."""
     guidance = catalog.category_info(content_type, category)["guidance"]
-    point_count = catalog.outline_point_count(duration_seconds)
-    data = provider.generate_json(*prompts.outline(guidance, topic, duration_seconds, point_count), prompts.OUTLINE_SCHEMA)
+    point_count = point_count or catalog.outline_point_count(duration_seconds)
+    data = provider.generate_json(*prompts.outline(guidance, topic, duration_seconds, point_count,
+                                                   catalog.style_instruction(style), source), prompts.OUTLINE_SCHEMA)
     items = []
     for point in data.get("points") or []:
         text = _clean(point.get("text") if isinstance(point, dict) else point)
@@ -93,10 +97,11 @@ def _paragraphs(value) -> list[str]:
 
 
 def write_script(provider: BaseAIProvider, content_type: str, category: str, topic: str,
-                 title: str, points: list[dict]) -> dict:
+                 title: str, points: list[dict], style: str | None = None, source: str = "") -> dict:
     guidance = catalog.category_info(content_type, category)["guidance"]
     hook_words, paragraph_words = _word_budget(points)
-    data = provider.generate_json(*prompts.script(guidance, topic, title, points, hook_words, paragraph_words),
+    data = provider.generate_json(*prompts.script(guidance, topic, title, points, hook_words, paragraph_words,
+                                                  catalog.style_instruction(style), source),
                                   prompts.SCRIPT_SCHEMA)
     paragraphs = _paragraphs(data.get("paragraphs") or data.get("body"))
     result = {"title": _clean(data.get("title")) or title, "hook": _clean(data.get("hook")), "body": "\n\n".join(paragraphs)}
@@ -105,12 +110,14 @@ def write_script(provider: BaseAIProvider, content_type: str, category: str, top
     return result
 
 
-def adjust_length(provider: BaseAIProvider, content_type: str, category: str, script: dict, ratio: float) -> dict:
+def adjust_length(provider: BaseAIProvider, content_type: str, category: str, script: dict, ratio: float,
+                  style: str | None = None) -> dict:
     """Ask the AI to lengthen or shorten every paragraph by `ratio`, keeping facts and order."""
     guidance = catalog.category_info(content_type, category)["guidance"]
     paragraphs = _paragraphs(script["body"])
     targets = [max(5, round(len(text.split()) * ratio)) for text in paragraphs]
-    data = provider.generate_json(*prompts.adjust_length(guidance, paragraphs, targets), prompts.ADJUST_SCHEMA, temperature=0.4)
+    data = provider.generate_json(*prompts.adjust_length(guidance, paragraphs, targets, catalog.style_instruction(style)),
+                                  prompts.ADJUST_SCHEMA, temperature=0.4)
     rewritten = _paragraphs(data.get("paragraphs"))
     if len(rewritten) < max(1, len(paragraphs) // 2):
         raise ProviderResponseError("AI chỉnh độ dài kịch bản không hợp lệ. Hãy viết lại.")
@@ -118,7 +125,7 @@ def adjust_length(provider: BaseAIProvider, content_type: str, category: str, sc
 
 
 def fit_script_duration(provider: BaseAIProvider | None, content_type: str, category: str, script: dict,
-                        target_seconds: int, voice: str, progress=None) -> dict:
+                        target_seconds: int, voice: str, progress=None, style: str | None = None) -> dict:
     """Measure real TTS length; if far off let the AI rewrite (when a provider is given), then tune the speaking rate.
 
     Passing provider=None keeps the text untouched (used after manual edits and before rendering).
@@ -134,7 +141,7 @@ def fit_script_duration(provider: BaseAIProvider | None, content_type: str, cate
             break
         direction = "kéo dài" if seconds < target_seconds else "rút ngắn"
         report(f"AI {direction} kịch bản (lần {attempt + 1})")
-        script = adjust_length(provider, content_type, category, script, target_seconds / seconds)
+        script = adjust_length(provider, content_type, category, script, target_seconds / seconds, style)
         seconds = timing.measure(timing.narration(script), voice)
         report(f"Đo lại: {seconds:.1f}s")
     fitted = timing.fit_rate(timing.narration(script), voice, target_seconds, progress, measured_seconds=seconds)
@@ -169,6 +176,71 @@ def split_scenes(provider: BaseAIProvider, title: str, topic: str, hook: str, bo
     if len(scenes) != count:
         logger.info("scene_count_mismatch expected=%d got=%d", count, len(scenes))
     return {"subject": subject, "scenes": scenes}
+
+
+class ScriptImportError(ValueError):
+    pass
+
+
+SCRIPT_JSON_EXAMPLE = """{
+  "title": "Trận Bạch Đằng năm 938",
+  "hook": "Một bãi cọc gỗ dưới lòng sông đã chấm dứt hơn một nghìn năm Bắc thuộc.",
+  "paragraphs": ["Đoạn lời đọc 1...", "Đoạn lời đọc 2..."],
+  "outline": [{"text": "Bối cảnh", "seconds": 15}],
+  "scenes": [{"text": "Lời đọc của cảnh", "image_query_vi": "sông Bạch Đằng",
+              "image_query_en": "Bach Dang river", "image_prompt": "..."}]
+}"""
+
+
+def parse_script_json(text: str) -> dict:
+    """Script written elsewhere (e.g. pasted from a chat) as JSON.
+
+    Needs "title", "hook" and "paragraphs" (list) or "body" (text); "outline" and "scenes" are optional.
+    Returns {"script", "outline" (list or None), "scenes" (list or None), "subject"}.
+    """
+    raw = (text or "").strip()
+    fenced = re.search(r"```(?:json)?\s*(.*?)```", raw, re.S)
+    try:
+        data = json.loads(fenced.group(1) if fenced else raw)
+    except ValueError as error:
+        raise ScriptImportError(f"JSON không hợp lệ ({error}).") from error
+    if not isinstance(data, dict):
+        raise ScriptImportError("JSON phải là một object {...}.")
+    paragraphs = _paragraphs(data.get("paragraphs") if data.get("paragraphs") is not None else data.get("body"))
+    script = {"title": _clean(data.get("title")), "hook": _clean(data.get("hook")), "body": "\n\n".join(paragraphs)}
+    missing = [name for name, value in (("title", script["title"]), ("hook", script["hook"]),
+                                        ("paragraphs/body", script["body"])) if not value]
+    if missing:
+        raise ScriptImportError(f"Thiếu trường: {', '.join(missing)}.")
+    outline = None
+    if data.get("outline"):
+        outline = []
+        for point in data["outline"]:
+            content = _clean(point.get("text") if isinstance(point, dict) else point)
+            seconds = point.get("seconds") if isinstance(point, dict) else None
+            if content:
+                outline.append({"text": content,
+                                "seconds": seconds if isinstance(seconds, int) and not isinstance(seconds, bool) else None})
+    nested = data["subject"] if isinstance(data.get("subject"), dict) else {}
+    subject = {"vi": _clean(data.get("subject_vi") or nested.get("vi")),
+               "en": _clean(data.get("subject_en") or nested.get("en"))}
+    scenes = None
+    if data.get("scenes"):
+        scenes = []
+        for item in data["scenes"]:
+            if not isinstance(item, dict) or not _clean(item.get("text")):
+                raise ScriptImportError("Mỗi cảnh cần có \"text\" (lời đọc của cảnh).")
+            query_en = _clean(item.get("image_query_en"))
+            scenes.append({
+                "text": _clean(item["text"]),
+                "image_query_vi": _clean(item.get("image_query_vi")) or subject["vi"],
+                "image_query_en": query_en or subject["en"] or script["title"],
+                "image_prompt": _clean(item.get("image_prompt")) or query_en or _clean(item["text"]),
+                "image": None,
+            })
+        if len(scenes) < 2:
+            raise ScriptImportError("Cần ít nhất 2 cảnh, hoặc bỏ trường \"scenes\" để AI tự chia cảnh.")
+    return {"script": script, "outline": outline, "scenes": scenes, "subject": subject}
 
 
 def word_count(text: str) -> int:

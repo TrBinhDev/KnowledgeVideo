@@ -41,12 +41,53 @@ TEMPLATES_BY_TYPE = {
 
 RESOLUTIONS = ("1080x1920", "720x1280")
 
+# Narration style: label and the instruction added to the outline, script and length-adjust prompts.
+STYLES = {
+    "ke_chuyen": ("Kể chuyện hấp dẫn", "Kể như một câu chuyện có bối cảnh, nhân vật, tình huống và cao trào; "
+                                       "câu văn giàu hình ảnh nhưng không thêm chi tiết không có thật."),
+    "tu_lieu": ("Tư liệu trang trọng", "Giọng thuyết minh phim tài liệu: trang trọng, chính xác, mạch lạc; "
+                                       "không cảm thán, không dùng từ lóng."),
+    "ngan_gon": ("Ngắn gọn, nhịp nhanh", "Câu ngắn, nhịp nhanh kiểu video TikTok; mỗi câu một thông tin, "
+                                         "đi thẳng vào điểm chính."),
+    "giang_giai": ("Giảng giải dễ hiểu", "Như thầy cô giảng bài cho học sinh: giải thích nguyên nhân – diễn biến – "
+                                         "kết quả, dùng so sánh gần gũi."),
+}
+
+# None = derived from the duration (outline_point_count).
+POINT_COUNTS = (None, 3, 4, 5, 6, 7, 8)
+
+SCENE_TIMINGS = {
+    "sentences": "Theo câu đọc",
+    "even": "Chia đều",
+}
+
+SUBTITLE_STYLES = {
+    "normal": "Thường",
+    "highlight": "Highlight từng từ",
+    "off": "Tắt phụ đề",
+}
+
+# "template" cycles the template's own set (title_cards.HISTORY_TRANSITIONS); "none" is a hard cut.
+TRANSITIONS = {
+    "template": "Theo template",
+    "fade": "Mờ dần",
+    "dissolve": "Hòa tan",
+    "fadeblack": "Chớp đen",
+    "smoothleft": "Lướt ngang",
+    "hblur": "Nhòe ngang",
+    "none": "Không chuyển cảnh (cắt thẳng)",
+}
+
 # Measured on Edge TTS vi-VN-HoaiMyNeural: 118 words -> 31s (~3.8 words/s); used to size prompts and estimates.
 WORDS_PER_SECOND = 3.7
 
 
 def outline_point_count(duration_seconds: int) -> int:
     return max(3, min(10, round(duration_seconds / 15)))
+
+
+def style_instruction(style: str | None) -> str:
+    return f"Phong cách lời kể: {STYLES[style][1]}" if style in STYLES else ""
 
 
 def scene_count(duration_seconds: int) -> int:

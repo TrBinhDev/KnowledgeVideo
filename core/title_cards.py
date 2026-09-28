@@ -19,7 +19,14 @@ HISTORY_GRADES = {
     "history-archive": "hue=s=0,colorbalance=rs=.08:gs=.03:bs=-.06,vignette=PI/5,noise=alls=8:allf=t,",
 }
 
-_SERIF_FILES = ("C:/Windows/Fonts/times.ttf", "C:/Windows/Fonts/timesbd.ttf")
+# xfade transitions cycled through a video's cuts when the transition choice is "template".
+HISTORY_TRANSITIONS = {
+    "history-scroll": ("dissolve", "fadeblack"),
+    "history-imperial": ("smoothleft", "fade"),
+    "history-archive": ("fadeblack", "hblur"),
+}
+
+_SERIF_FILES =("C:/Windows/Fonts/times.ttf", "C:/Windows/Fonts/timesbd.ttf")
 _families: dict[str, str] = {}
 _qt_application = None
 

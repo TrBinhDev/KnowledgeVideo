@@ -33,10 +33,21 @@ Hãy gợi ý đúng {count} chủ đề video cụ thể, khác nhau, bám sát
     return system, user
 
 
-def outline(guidance: str, topic: str, duration_seconds: int, point_count: int) -> tuple[str, str]:
+_SOURCE_RULE = """- CÓ TÀI LIỆU NGUỒN: chỉ dùng dữ kiện (năm, tên người, địa danh, số liệu, sự kiện) có trong tài liệu nguồn;
+  không thêm dữ kiện từ hiểu biết riêng. Được diễn đạt lại, rút gọn và sắp xếp cho dễ nghe."""
+
+
+def _source_block(source: str) -> str:
+    return f'\n\nTài liệu nguồn:\n"""{source}"""' if source else ""
+
+
+def outline(guidance: str, topic: str, duration_seconds: int, point_count: int, style: str = "",
+            source: str = "") -> tuple[str, str]:
     system = f"""Bạn là biên kịch video kiến thức ngắn.
 {guidance}
+{style}
 {_COMMON_RULES}
+{_SOURCE_RULE if source else ""}
 - "seconds" là số giây dành cho ý đó khi đọc thành lời; tổng "seconds" của mọi ý phải đúng bằng thời lượng video.
 Schema:
 {{"title": "Tiêu đề video, dưới 90 ký tự", "points": [{{"text": "Nội dung ý", "seconds": 20}}]}}"""
@@ -45,15 +56,17 @@ Thời lượng video: đúng {duration_seconds} giây.
 
 Lập đề cương gồm đúng {point_count} ý theo trình tự kể chuyện (mở vấn đề → diễn biến → kết/ý nghĩa).
 Mỗi ý là 1 câu ngắn nêu nội dung chính sẽ nói, kèm số giây; ý quan trọng được nhiều giây hơn.
-Tổng số giây của {point_count} ý phải bằng {duration_seconds}."""
+Tổng số giây của {point_count} ý phải bằng {duration_seconds}.{_source_block(source)}"""
     return system, user
 
 
 def script(guidance: str, topic: str, title: str, points: list[dict], hook_words: int,
-           paragraph_words: list[int]) -> tuple[str, str]:
+           paragraph_words: list[int], style: str = "", source: str = "") -> tuple[str, str]:
     system = f"""Bạn là biên kịch video kiến thức ngắn cho nền tảng video dọc.
 {guidance}
+{style}
 {_COMMON_RULES}
+{_SOURCE_RULE if source else ""}
 - Hook là 1 câu mở đầu nêu thẳng điều thú vị nhất của chủ đề; không mở bằng "Bạn có biết", "Hãy cùng khám phá".
 - Không viết chỉ dẫn hình ảnh/cảnh quay/hiệu ứng trong hook hoặc các đoạn.
 - "paragraphs" có đúng một đoạn cho mỗi ý của đề cương, đúng thứ tự; không lặp lại hook.
@@ -69,13 +82,14 @@ Hook: khoảng {hook_words} từ.
 Đề cương đã được duyệt (mỗi ý thành 1 đoạn, kèm số từ cần viết):
 {numbered}
 
-Tổng cộng khoảng {hook_words + sum(paragraph_words)} từ. Viết kịch bản lời đọc hoàn chỉnh bám sát đề cương."""
+Tổng cộng khoảng {hook_words + sum(paragraph_words)} từ. Viết kịch bản lời đọc hoàn chỉnh bám sát đề cương.{_source_block(source)}"""
     return system, user
 
 
-def adjust_length(guidance: str, paragraphs: list[str], targets: list[int]) -> tuple[str, str]:
+def adjust_length(guidance: str, paragraphs: list[str], targets: list[int], style: str = "") -> tuple[str, str]:
     system = f"""Bạn là biên tập viên lời đọc video.
 {guidance}
+{style}
 {_COMMON_RULES}
 - Viết lại từng đoạn cho đạt đúng số từ mục tiêu (sai lệch tối đa 10%), giữ nguyên ý chính và thứ tự đoạn.
 - Khi cần dài hơn: chỉ thêm giải thích bối cảnh, nguyên nhân, ý nghĩa; KHÔNG thêm năm, số liệu, tên người hay sự kiện mới.

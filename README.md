@@ -6,12 +6,16 @@
 
 ## Luồng tạo video
 
-1. **Bắt đầu** – chọn danh mục (Lịch sử), AI viết kịch bản (Ollama hoặc Gemini, chọn model), thời lượng; nhập từ khóa hoặc chủ đề.
-2. **Chọn chủ đề** – AI gợi ý vài chủ đề, người dùng chọn hoặc sửa.
-3. **Đề cương** – mỗi ý kèm số giây (`20s | nội dung`), tổng luôn bằng thời lượng đã chọn; duyệt/sửa được.
-4. **Kịch bản** – viết theo số từ của từng đoạn; đo thời lượng bằng giọng đọc thật rồi tự chỉnh độ dài và tốc độ đọc để sai số trong khoảng ±3 giây.
-5. **Cảnh & ảnh** – chia cảnh, mỗi cảnh tự tìm ảnh theo từ khóa riêng (tiếng Việt và tiếng Anh); đổi ảnh từng cảnh được.
-6. **Render** – chọn giọng đọc, template lịch sử, nhạc nền; xuất MP4 kèm phụ đề SRT/VTT.
+1. **Nội dung** – chọn loại nội dung (Kiến thức – Lịch sử), AI viết nội dung (Ollama hoặc Gemini, chọn model), độ dài video, giọng đọc, phong cách lời kể (kể chuyện, tư liệu, ngắn gọn, giảng giải), số ý chính. Rồi chọn một trong ba cách bắt đầu:
+   - **Nhập từ khóa** – AI gợi ý chủ đề (bước 2).
+   - **Nhập nội dung trực tiếp** – dán hoặc tải file `.txt`, `.docx`, `.pdf` (tối đa 10MB, dùng 15.000 ký tự đầu). *AI tóm tắt*: đề cương và lời đọc chỉ dùng dữ kiện trong tài liệu. *Dùng nguyên văn*: nội dung chính là lời đọc (dòng đầu ngắn là tiêu đề, câu đầu là hook), app chỉ chỉnh tốc độ đọc.
+   - **Nhập kịch bản JSON** – dán kịch bản viết sẵn (ví dụ từ Claude/ChatGPT): `title`, `hook`, `paragraphs`; tùy chọn `outline` và `scenes` (lời đọc + từ khóa ảnh mỗi cảnh, có thì bỏ qua bước AI chia cảnh).
+2. **Chủ đề** – AI gợi ý vài chủ đề kèm mô tả ngắn, người dùng chọn, sửa hoặc tự nhập.
+3. **Kịch bản** – đề cương mỗi ý kèm mốc thời gian (`[0-15s]`), tổng luôn bằng độ dài đã chọn; sau khi xác nhận, AI viết lời đọc theo số từ của từng ý, đo bằng giọng đọc thật rồi tự chỉnh độ dài và tốc độ đọc để sai số trong khoảng ±3 giây. Cả hai đều sửa được.
+4. **Cảnh & ảnh** – chia cảnh, mỗi cảnh tự tìm ảnh theo từ khóa riêng (tiếng Việt và tiếng Anh); đổi ảnh từng cảnh được.
+5. **Mẫu & Render** – chọn template lịch sử (có ảnh mẫu), kiểu chuyển cảnh, giọng đọc, nhạc nền; xem trước template và chuyển cảnh bằng ảnh thật của video; xuất MP4 kèm phụ đề SRT/VTT.
+   - **Nhịp ảnh**: *Theo câu đọc* (mỗi ảnh xuất hiện đúng lúc giọng đọc nói tới cảnh đó) hoặc *Chia đều*.
+   - **Phụ đề**: *Thường*, *Highlight từng từ* (từ đang đọc đổi màu, kiểu TikTok, theo mốc thời gian từng từ của Edge TTS) hoặc *Tắt*.
 
 Mọi bước AI đều có duyệt/sửa: **AI có thể viết sai năm tháng, tên người, sự kiện — luôn kiểm tra kịch bản trước khi render.**
 
@@ -35,6 +39,8 @@ Không cần API key cho các nguồn trên. Nút "Ảnh AI (Gemini)" chỉ dùn
 | Cổ thư | Cuộn giấy da, con dấu năm, ảnh tông sepia |
 | Hoàng triều | Dải đỏ son viền vàng kim |
 | Tư liệu | Viền phim, năm cỡ lớn, ảnh đen trắng |
+
+Chuyển cảnh: "Theo template" dùng bộ riêng của từng template (Cổ thư: hòa tan, chớp đen; Hoàng triều: lướt ngang, mờ dần; Tư liệu: chớp đen, nhòe ngang), hoặc chọn một kiểu cố định, hoặc cắt thẳng.
 
 ## Yêu cầu
 
@@ -72,11 +78,19 @@ Mở `.env` và điền các giá trị cần dùng (không commit file này):
 .\.venv\Scripts\python.exe main.py
 ```
 
+Sidebar có 4 mục:
+
+- **Tạo video** – 5 bước ở trên; nút "Video mới" để bắt đầu lại. Khi render có nút **Hủy**; xong thì **Xuất video** (MP4 kèm phụ đề `.srt` và ảnh bìa `.jpg` cùng tên ra thư mục bạn chọn).
+- **Lịch sử video** – các video đã làm, mở lại để sửa ảnh, đổi mẫu hoặc render lại.
+- **Mẫu video** – xem trước từng template với chuyển cảnh và chuyển động Ken Burns (dùng ảnh của video gần nhất, chưa có thì dùng ảnh minh họa tự vẽ); "Dùng mẫu này" áp dụng cho video đang làm.
+- **Cài đặt** – sửa các giá trị trong `.env` ngay trong app, có hiệu lực không cần mở lại.
+
 Mỗi lần tạo video được lưu trong `output/<ngày_giờ>__<chủ-đề>/`:
 
-- `state.json` – chủ đề, đề cương, kịch bản, cảnh, nguồn và giấy phép ảnh
+- `state.json` – chủ đề, đề cương, kịch bản, cảnh, nguồn và giấy phép ảnh, lựa chọn render
 - `assets/` – ảnh của từng cảnh
-- `render/final.mp4`, `render/subtitles.srt`, `render/subtitles.vtt`
+- `render/final.mp4`, `render/thumbnail.jpg` (ảnh bìa), `render/subtitles.srt`, `render/subtitles.vtt`
+- `preview/` – ảnh mẫu và clip xem trước (có thể xóa, sẽ tự tạo lại)
 
 Log ở `output/logs/app.log`.
 
@@ -84,7 +98,12 @@ Log ở `output/logs/app.log`.
 
 ```
 main.py              Khởi động ứng dụng
-ui/                  Giao diện PySide6 (6 bước, panel tiến độ + timeline)
+ui/                  Giao diện PySide6: sidebar, 5 bước dạng card, panel tiến độ render
+ui/widgets.py        Card, thanh bước, lưới lựa chọn dạng card, panel tiến độ
+ui/icons.py          Bộ icon nét mảnh (SVG vẽ riêng)
+ui/history_page.py   Lịch sử video
+ui/templates_page.py Mẫu video
+ui/settings_page.py  Cài đặt (.env)
 core/ai/             Ollama, Gemini (danh sách model, tự chuyển model khi quá tải)
 core/prompts.py      Prompt và JSON schema cho từng bước AI
 core/steps.py        Gợi ý chủ đề, đề cương, kịch bản, canh thời lượng, chia cảnh
@@ -93,6 +112,9 @@ core/images.py       Tìm/tải ảnh, lọc bài/ảnh lạc đề, ảnh thay 
 core/title_cards.py  Thẻ tiêu đề cho template lịch sử (vẽ bằng Qt)
 core/video_pipeline.py  TTS, phụ đề, ghép ảnh, FFmpeg, kiểm tra MP4
 core/render.py       Chuẩn bị dữ liệu render
+core/preview.py      Ảnh mẫu template và clip xem trước chuyển cảnh (dùng chung bộ lọc với render)
+core/samples.py      Ảnh minh họa tự vẽ cho trang Mẫu video khi chưa có video nào
+core/sources.py      Đọc tài liệu txt/docx/pdf, tách nội dung nguyên văn thành tiêu đề/hook/thân bài
 assets/templates/    Khung SVG cho template tin tức
 ```
 
@@ -100,4 +122,5 @@ assets/templates/    Khung SVG cho template tin tức
 
 - Model nhỏ chạy local (`gemma3` 4B) hay bịa sự kiện lịch sử; Gemini chính xác hơn nhưng vẫn phải kiểm tra.
 - Tìm ảnh tự động vẫn có cảnh ra ảnh lệch nội dung, nhất là chủ đề trừu tượng; nên xem lại từng cảnh.
-- Ảnh được chia đều theo thời lượng video, chưa khớp chính xác theo từng câu đọc.
+- "Theo câu đọc" ước lượng điểm đổi ảnh theo độ dài chữ của từng cảnh trên mốc thời gian từng câu; ranh giới cảnh nằm giữa câu có thể lệch vài trăm mili giây.
+- PDF dạng ảnh scan không đọc được (cần OCR).

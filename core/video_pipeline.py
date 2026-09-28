@@ -7,14 +7,16 @@ import re
 import shutil
 import subprocess
 import textwrap
+import threading
 from pathlib import Path
 from urllib.parse import urlparse
 
 import edge_tts
 from edge_tts.exceptions import NoAudioReceived
 
+from core.catalog import TRANSITIONS
 from core.network_security import fetch_safe_bytes
-from core.title_cards import HISTORY_GRADES, HISTORY_TEMPLATES, render_title_card
+from core.title_cards import HISTORY_GRADES, HISTORY_TEMPLATES, HISTORY_TRANSITIONS, render_title_card
 
 logger = logging.getLogger("kv.pipeline")
 
@@ -27,7 +29,53 @@ _VECTOR_TEMPLATE_FILES = {
 _VIDEO_FPS = 30
 _MAX_ARTICLE_IMAGES = 16
 _TTS_ATTEMPTS = 3
+TRANSITION_SECONDS = 0.6
 _qt_application = None
+
+
+def transition_names(template: str, choice: str, cuts: int) -> list[str]:
+    """xfade transition name for each cut between scenes ("none" = hard cut)."""
+    if choice not in TRANSITIONS:
+        raise RuntimeError("Kiểu chuyển cảnh không hợp lệ.")
+    if choice == "none":
+        return ["none"] * cuts
+    cycle = HISTORY_TRANSITIONS.get(template, ("fade",)) if choice == "template" else (choice,)
+    return [cycle[index % len(cycle)] for index in range(cuts)]
+
+
+def transition_seconds(scene_duration: float, names: list[str]) -> float:
+    if not names or names[0] == "none":
+        return 0.0
+    return min(TRANSITION_SECONDS, scene_duration * 0.20)
+
+
+def scene_look(width: int, height: int, grade: str) -> str:
+    """Per-scene filter shared by the render and the preview: fill the frame, darken slightly for text, grade."""
+    return (
+        f"fps={_VIDEO_FPS},scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
+        f"eq=brightness=-0.04:saturation=0.98,{grade}"
+    )
+
+
+def join_scenes(count: int, starts: list[float], names: list[str], overlap: float) -> list[str]:
+    """Filters joining [scene0]..[scene{count-1}] into [joined].
+
+    Every scene except the last must run `overlap` seconds past the next scene's start: scene i then begins
+    exactly at starts[i], in step with the narration.
+    """
+    if count == 1:
+        return ["[scene0]null[joined]"]
+    if not overlap:
+        return ["".join(f"[scene{index}]" for index in range(count)) + f"concat=n={count}:v=1:a=0[joined]"]
+    filters, previous = [], "scene0"
+    for index in range(1, count):
+        label = "joined" if index == count - 1 else f"transition{index}"
+        filters.append(
+            f"[{previous}][scene{index}]xfade=transition={names[index - 1]}:"
+            f"duration={overlap:.3f}:offset={starts[index]:.3f}[{label}]"
+        )
+        previous = label
+    return filters
 
 
 def _rasterize_vector_template(template: str, width: int, directory: Path):
@@ -63,8 +111,63 @@ def _rasterize_vector_template(template: str, width: int, directory: Path):
     return output, raster_height
 
 
-def _render_qt_motion_scene(source: Path, output: Path, width: int, height: int,
-                             duration: float, direction: int) -> None:
+class RenderCancelled(RuntimeError):
+    """The user cancelled the render."""
+
+
+# Media processes per worker thread, so cancelling a render leaves previews running in other threads alone.
+_processes: dict[int, set] = {}
+_cancelled: set[int] = set()
+_process_lock = threading.Lock()
+
+
+def cancel_thread(thread_id: int) -> None:
+    """Stop the media work of one worker thread: kill its running ffmpeg and refuse to start new ones."""
+    with _process_lock:
+        _cancelled.add(thread_id)
+        processes = list(_processes.get(thread_id, ()))
+    for process in processes:
+        _kill_tree(process)
+
+
+def _kill_tree(process: subprocess.Popen) -> None:
+    # "ffmpeg" on PATH may be a launcher shim (e.g. Chocolatey) whose child is the real encoder, and killing only
+    # the shim leaves that child running; taskkill /T ends the whole tree.
+    if os.name == "nt":
+        subprocess.run(["taskkill", "/PID", str(process.pid), "/T", "/F"], capture_output=True,
+                       creationflags=subprocess.CREATE_NO_WINDOW)
+    process.kill()
+
+
+def clear_cancel(thread_id: int) -> None:
+    with _process_lock:
+        _cancelled.discard(thread_id)
+
+
+def check_cancelled() -> None:
+    if threading.get_ident() in _cancelled:
+        raise RenderCancelled("Đã hủy render.")
+
+
+def _start(arguments, **options) -> subprocess.Popen:
+    thread_id = threading.get_ident()
+    with _process_lock:
+        if thread_id in _cancelled:
+            raise RenderCancelled("Đã hủy render.")
+        process = subprocess.Popen(arguments, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
+                                   **options)
+        _processes.setdefault(thread_id, set()).add(process)
+    return process
+
+
+def _release(process: subprocess.Popen) -> None:
+    with _process_lock:
+        _processes.get(threading.get_ident(), set()).discard(process)
+
+
+def render_motion_scene(source: Path, output: Path, width: int, height: int,
+                        duration: float, direction: int) -> None:
+    """Ken Burns clip of one still image: slow zoom and pan, drawn frame by frame with Qt and encoded by ffmpeg."""
     try:
         from PySide6.QtCore import QRectF, Qt
         from PySide6.QtGui import QGuiApplication, QImage, QPainter
@@ -97,14 +200,8 @@ def _render_qt_motion_scene(source: Path, output: Path, width: int, height: int,
         "-c:v", "libx264", "-preset", "ultrafast", "-crf", "12",
         "-pix_fmt", "yuv420p", str(output.name),
     ]
-    process = subprocess.Popen(
-        command,
-        cwd=output.parent,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.PIPE,
-        creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0,
-    )
+    process = _start(command, cwd=output.parent, stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                     stderr=subprocess.PIPE)
     try:
         for frame_index in range(frame_count):
             progress = frame_index / frame_end
@@ -136,10 +233,14 @@ def _render_qt_motion_scene(source: Path, output: Path, width: int, height: int,
         error_output = process.stderr.read().decode("utf-8", errors="replace")
         process.stderr.close()
         return_code = process.wait(timeout=600)
-    except Exception:
+    except Exception as error:
         process.kill()
         process.wait(timeout=30)
-        raise
+        check_cancelled()  # a cancel kills ffmpeg, which surfaces here as a broken pipe
+        raise error
+    finally:
+        _release(process)
+    check_cancelled()
     if return_code:
         raise RuntimeError(f"ffmpeg Ken Burns: {error_output[-1800:]}")
 
@@ -160,12 +261,20 @@ def _text_block_width(lines: list[str], font_path: Path, pixel_size: int) -> int
 
 
 def run_media(arguments, directory, timeout=600):
-    result = subprocess.run(arguments, cwd=directory, capture_output=True, text=True,
-                            encoding="utf-8", errors="replace", timeout=timeout,
-                            creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
-    if result.returncode:
-        raise RuntimeError(f"{Path(arguments[0]).name}: {result.stderr[-1800:]}")
-    return result.stdout
+    process = _start(arguments, cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                     encoding="utf-8", errors="replace")
+    try:
+        stdout, stderr = process.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.communicate()
+        raise
+    finally:
+        _release(process)
+    check_cancelled()
+    if process.returncode:
+        raise RuntimeError(f"{Path(arguments[0]).name}: {stderr[-1800:]}")
+    return stdout
 
 
 def probe(path):
@@ -251,16 +360,168 @@ def _asset_kind(path: Path, info: dict) -> str:
     return "video" if any(stream.get("codec_type") == "video" for stream in info.get("streams", [])) else "image"
 
 
-async def synthesize(text, voice, directory, rate="+0%"):
+_SENTENCE_BREAK = re.compile(r"(?<=[.!?…])\s+|\n+")
+MIN_SCENE_SECONDS = 2.0
+
+
+def _sentences(text: str) -> list[str]:
+    return [part.strip() for part in _SENTENCE_BREAK.split(text) if part.strip()]
+
+
+def _word_key(value: str) -> str:
+    return _speech_key(value).replace(" ", "")
+
+
+def align_words(text: str, words: list[tuple[float, float, str]]) -> list[tuple[int, str, float, float]]:
+    """Time every written token of `text` from Edge TTS word boundaries: (sentence index, token, start, end).
+
+    Spoken words carry no punctuation and a number or abbreviation may be read as several words, so tokens are
+    matched in order within a small window; tokens left unmatched take the gap between their neighbours.
+    """
+    tokens = [(index, token) for index, sentence in enumerate(_sentences(text)) for token in sentence.split()]
+    keys = [_word_key(token) for _index, token in tokens]
+    times: list = [None] * len(tokens)
+    pointer = 0
+    for start, end, word in words:
+        key = _word_key(word)
+        for position in range(pointer, min(pointer + 6, len(tokens))):
+            if keys[position] and keys[position] == key:
+                times[position] = (start, end)
+                pointer = position + 1
+                break
+    last_end = 0.0
+    for position, value in enumerate(times):
+        if value is None:
+            following = next((times[later][0] for later in range(position + 1, len(times)) if times[later]), last_end)
+            times[position] = (last_end, max(last_end, following))
+        last_end = times[position][1]
+    return [(index, token, start, end) for (index, token), (start, end) in zip(tokens, times)]
+
+
+def _sentence_cues(text: str, tokens) -> list[tuple[float, float, str]]:
+    spans: dict[int, list[float]] = {}
+    for index, _token, start, end in tokens:
+        span = spans.setdefault(index, [start, end])
+        span[0], span[1] = min(span[0], start), max(span[1], end)
+    return [(spans[index][0], spans[index][1], sentence) for index, sentence in enumerate(_sentences(text))
+            if index in spans]
+
+
+def scene_starts(cues, scene_texts: list[str], duration: float, minimum: float = MIN_SCENE_SECONDS) -> list[float]:
+    """Start of each scene at the moment its words begin to be spoken.
+
+    Scene texts are consecutive slices of the narration, so each boundary's share of the scene characters is
+    located on the sentence cues (spoken timeline) and snapped to a sentence start when close to one. Scenes are
+    kept at least `minimum` seconds; when that cannot fit, scenes are spread evenly.
+    """
+    count = len(scene_texts)
+    even = [index * duration / count for index in range(count)]
+    if count < 2 or not cues or count * minimum > duration:
+        return even
+    scene_sizes = [max(1, len(_word_key(text))) for text in scene_texts]
+    cue_sizes = [max(1, len(_word_key(content))) for _start, _end, content in cues]
+    starts, before = [0.0], 0
+    for index in range(1, count):
+        before += scene_sizes[index - 1]
+        position = before / sum(scene_sizes) * sum(cue_sizes)
+        offset = 0
+        moment = even[index]
+        for cue_index, ((start, end, _content), size) in enumerate(zip(cues, cue_sizes)):
+            if offset + size >= position:
+                fraction = (position - offset) / size
+                moment = start + fraction * (end - start)
+                if fraction < 0.2:
+                    moment = start
+                elif fraction > 0.85 and cue_index + 1 < len(cues):
+                    moment = cues[cue_index + 1][0]
+                break
+            offset += size
+        starts.append(moment)
+    for index in range(1, count):
+        starts[index] = max(starts[index], starts[index - 1] + minimum)
+    starts.append(duration)
+    for index in range(count - 1, 0, -1):
+        starts[index] = min(starts[index], starts[index + 1] - minimum)
+    return starts[:count]
+
+
+_ASS_HEADER = """[Script Info]
+ScriptType: v4.00+
+PlayResX: 384
+PlayResY: 288
+WrapStyle: 2
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,Arial,12,&H00FFFFFF,&H00FFFFFF,&H90000000,&H70000000,0,0,0,0,100,100,0,0,1,2,0,2,20,20,20,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+# Colour of the word being spoken (ASS colours are &HBBGGRR&): amber.
+HIGHLIGHT_COLOUR = "&H00C8FF&"
+
+
+def _ass_time(seconds: float) -> str:
+    centiseconds = max(0, round(seconds * 100))
+    return f"{centiseconds // 360000}:{centiseconds // 6000 % 60:02d}:{centiseconds // 100 % 60:02d}.{centiseconds % 100:02d}"
+
+
+def highlight_subtitles(tokens, start_after: float, duration: float, max_chars: int = 56, line_chars: int = 32) -> str:
+    """ASS subtitles showing a caption chunk with the word being spoken in HIGHLIGHT_COLOUR (TikTok style).
+
+    Same play resolution and default header as the SRT path, so the shared force_style gives the same look.
+    """
+    chunks: list[list] = []
+    for position, token in enumerate(tokens):
+        # A short end of sentence ("Đằng.") stays with its chunk instead of flashing up alone.
+        rest = len(" ".join(t[1] for t in tokens[position:] if t[0] == token[0]))
+        same_sentence = chunks and chunks[-1][0][0] == token[0]
+        if same_sentence and (len(" ".join(t[1] for t in chunks[-1] + [token])) <= max_chars or rest <= 12):
+            chunks[-1].append(token)
+        else:
+            chunks.append([token])
+    events = []
+    for chunk_index, chunk in enumerate(chunks):
+        words = [t[1].replace("{", "(").replace("}", ")").replace("\\", "/") for t in chunk]
+        lines, current = [], []
+        for position, word in enumerate(words):
+            if current and len(" ".join(words[i] for i in current + [position])) > line_chars:
+                lines.append(current)
+                current = []
+            current.append(position)
+        lines.append(current)
+        next_chunk_start = chunks[chunk_index + 1][0][2] if chunk_index + 1 < len(chunks) else duration
+        for position, (_sentence, _token, start, end) in enumerate(chunk):
+            finish = chunk[position + 1][2] if position + 1 < len(chunk) else end
+            if position + 1 == len(chunk) and next_chunk_start - end < 1.0:
+                finish = next_chunk_start  # keep the caption up through short pauses
+            start, finish = max(start, start_after), min(finish, duration)
+            if finish - start < 0.02:
+                continue
+            text = "\\N".join(" ".join(f"{{\\c{HIGHLIGHT_COLOUR}}}{words[i]}{{\\c}}" if i == position else words[i]
+                                       for i in line) for line in lines)
+            events.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(finish)},Default,,0,0,0,,{text}")
+    return _ASS_HEADER + "\n".join(events) + "\n"
+
+
+async def synthesize(text, voice, directory, rate="+0%", word_cues: list | None = None):
+    """Speak `text` into voice.mp3 and return sentence cues (start, end, text).
+
+    With `word_cues` (a list to fill), Edge TTS reports word boundaries instead; they are stored there and the
+    sentence cues are rebuilt from them.
+    """
+    boundary = "WordBoundary" if word_cues is not None else "SentenceBoundary"
     for attempt in range(3):
         cues = []
-        communicator = edge_tts.Communicate(text, voice, rate=rate, boundary="SentenceBoundary")
+        communicator = edge_tts.Communicate(text, voice, rate=rate, boundary=boundary)
         try:
             with (directory / "voice.mp3").open("wb") as audio:
                 async for chunk in communicator.stream():
                     if chunk["type"] == "audio":
                         audio.write(chunk["data"])
-                    elif chunk["type"] == "SentenceBoundary":
+                    elif chunk["type"] == boundary:
                         cues.append((chunk["offset"] / 10000000,
                                      (chunk["offset"] + chunk["duration"]) / 10000000,
                                      html.unescape(chunk["text"])))
@@ -271,6 +532,9 @@ async def synthesize(text, voice, directory, rate="+0%"):
             continue
         if not cues or not (directory / "voice.mp3").stat().st_size:
             raise RuntimeError("TTS không trả audio hoặc mốc phụ đề.")
+        if word_cues is not None:
+            word_cues[:] = cues
+            return _sentence_cues(text, align_words(text, cues))
         return cues
     raise RuntimeError("TTS không trả audio sau khi thử lại.")
 
@@ -344,8 +608,14 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
         logo = directory / "logo_asset"
         shutil.copyfile(source, logo)
     stage("generate_tts", 20)
+    subtitle_mode = snapshot.get("subtitle_style", "normal")
+    if subtitle_mode not in ("normal", "highlight", "off"):
+        raise RuntimeError("Kiểu phụ đề không hợp lệ.")
+    words: list | None = [] if subtitle_mode == "highlight" else None
     for attempt in range(_TTS_ATTEMPTS):
-        cues = asyncio.run(asyncio.wait_for(tts(narration, snapshot["voice"], directory, snapshot.get("tts_rate", "+0%")), timeout=180))
+        options = {"word_cues": words} if words is not None else {}
+        cues = asyncio.run(asyncio.wait_for(
+            tts(narration, snapshot["voice"], directory, snapshot.get("tts_rate", "+0%"), **options), timeout=180))
         duration = float(probe(directory / "voice.mp3")["format"]["duration"])
         # Edge TTS can drop the audio stream mid-way while still returning every sentence boundary.
         if duration >= cues[-1][0] + 0.5:
@@ -360,6 +630,7 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
     if not show_title_card:
         banner_end = 0.0
     stage("generate_subtitle", 40)
+    sentence_cues = cues
     normalized_cues = []
     for index, (start, end, content) in enumerate(cues):
         end = min(end, cues[index + 1][0] if index + 1 < len(cues) else duration)
@@ -395,19 +666,33 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
     full_srt, full_vtt = subtitle_text(cues)
     (directory / "subtitles.srt").write_text(full_srt, encoding="utf-8")
     (directory / "subtitles.vtt").write_text(full_vtt, encoding="utf-8")
-    if subtitle_cues:
+    subtitle_file = ""
+    for stale in ("body_subtitles.srt", "body_subtitles.ass"):
+        (directory / stale).unlink(missing_ok=True)
+    if subtitle_cues and subtitle_mode == "normal":
         body_srt, _body_vtt = subtitle_text(subtitle_cues)
         (directory / "body_subtitles.srt").write_text(body_srt, encoding="utf-8")
+        subtitle_file = "body_subtitles.srt"
+    elif subtitle_mode == "highlight":
+        (directory / "body_subtitles.ass").write_text(
+            highlight_subtitles(align_words(narration, words), banner_end, duration), encoding="utf-8")
+        subtitle_file = "body_subtitles.ass"
     stage("build_timeline", 50)
     video_mode = snapshot.get("video_mode", "single_image")
-    scene_duration = duration / max(1, len(asset_entries))
+    scene_count = max(1, len(asset_entries))
+    scene_texts = snapshot.get("scene_texts") or []
+    if snapshot.get("scene_timing") == "sentences" and len(scene_texts) == len(asset_entries) > 1:
+        starts = scene_starts(sentence_cues, scene_texts, duration)
+    else:
+        starts = [index * duration / scene_count for index in range(scene_count)]
+    lengths = [end - start for start, end in zip(starts, starts[1:] + [duration])]
     scenes = [
         {
             "index": index,
             "file": path.name,
             "kind": kind,
-            "start": round(index * scene_duration, 3),
-            "end": round(min(duration, (index + 1) * scene_duration), 3),
+            "start": round(starts[index], 3),
+            "end": round(starts[index] + lengths[index], 3),
         }
         for index, (path, _info, kind) in enumerate(asset_entries)
     ]
@@ -532,13 +817,20 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
             "bottom": banner_y + int(banner_height * 0.54),
         }[title_position]
     source_x = "0.330*w-text_w/2" if template_artwork and not history_card else 36
+    transitions = transition_names(template, snapshot.get("transition", "template"), max(0, len(asset_entries) - 1))
+    overlap = transition_seconds(min(lengths), transitions)
+
+    def scene_length(index: int) -> float:
+        # Each scene but the last runs on through the transition into the next one.
+        return lengths[index] + (overlap if index < len(asset_entries) - 1 else 0.0)
+
     render_entries = asset_entries
     if asset_entries:
         render_entries = []
         for index, (path, info, kind) in enumerate(asset_entries):
             if kind == "image":
                 motion_path = directory / f"motion_scene_{index}.mp4"
-                _render_qt_motion_scene(path, motion_path, width, height, scene_duration, index)
+                render_motion_scene(path, motion_path, width, height, scene_length(index), index)
                 render_entries.append((motion_path, probe(motion_path), "video"))
             else:
                 render_entries.append((path, info, kind))
@@ -554,12 +846,11 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
         command += ["-f", "lavfi", "-i", f"color=c={background}:s={width}x{height}:r={_VIDEO_FPS}"]
         voice_index = 1
     command += ["-i", "voice.mp3"]
-    scene_duration = duration / max(1, len(asset_entries))
     scene_filters = []
     if render_entries:
         for index, (_path, _info, kind) in enumerate(render_entries):
             if kind == "image":
-                progress = f"min(max(t/{scene_duration:.6f},0),1)"
+                progress = f"min(max(t/{lengths[index]:.6f},0),1)"
                 eased_progress = f"({progress})*({progress})*(3-2*({progress}))"
                 pan_paths = (
                     (f"0.28+0.44*{eased_progress}", "0.5"),
@@ -579,37 +870,18 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
                     f"{grade}"
                 )
             else:
-                visual_filter = (
-                    f"fps={_VIDEO_FPS},scale={width}:{height}:force_original_aspect_ratio=increase,crop={width}:{height},"
-                    "eq=brightness=-0.04:saturation=0.98,"
-                    f"{grade}"
-                )
+                visual_filter = scene_look(width, height, grade)
             label = f"scene{index}"
             scene_filters.append(
-                f"[{index}:v]{visual_filter}setsar=1,trim=duration={scene_duration:.3f},"
+                f"[{index}:v]{visual_filter}setsar=1,trim=duration={scene_length(index):.3f},"
                 f"setpts=PTS-STARTPTS,format=yuv420p,settb=AVTB[{label}]"
             )
-        if len(render_entries) == 1:
-            scene_filters.append("[scene0]null[vsource]")
-        else:
-            transition_duration = min(0.32, scene_duration * 0.20)
-            previous_label = "scene0"
-            accumulated_duration = scene_duration
-            total_overlap = 0.0
-            for index in range(1, len(asset_entries)):
-                transition_label = f"transition{index}"
-                scene_filters.append(
-                    f"[{previous_label}][scene{index}]xfade=transition=fade:"
-                    f"duration={transition_duration:.3f}:offset={accumulated_duration - transition_duration:.3f}"
-                    f"[{transition_label}]"
-                )
-                previous_label = transition_label
-                accumulated_duration += scene_duration - transition_duration
-                total_overlap += transition_duration
-            scene_filters.append(
-                f"[{previous_label}]tpad=stop_mode=clone:stop_duration={total_overlap:.3f},"
-                f"trim=duration={duration:.3f},setpts=PTS-STARTPTS[vsource]"
-            )
+        scene_filters.extend(join_scenes(len(render_entries), starts, transitions, overlap))
+        # The clone pad only covers rounding in the per-scene trims.
+        scene_filters.append(
+            f"[joined]tpad=stop_mode=clone:stop_duration=1,"
+            f"trim=duration={duration:.3f},setpts=PTS-STARTPTS[vsource]"
+        )
     else:
         scene_filters.append("[0:v]null[vsource]")
     next_input_index = voice_index + 1
@@ -659,8 +931,8 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
         f"MarginR={max(60, width // 14)},MarginV={subtitle_margin},WrapStyle=2"
     )
     subtitle_filter = (
-        f"subtitles=body_subtitles.srt:original_size={width}x{height}:force_style='{subtitle_style}'"
-        if subtitle_cues else "null"
+        f"subtitles={subtitle_file}:original_size={width}x{height}:force_style='{subtitle_style}'"
+        if subtitle_file else "null"
     )
     source_overlay = ""
     if show_source:
