@@ -19,7 +19,8 @@ WIDTH, HEIGHT = 360, 640
 SCENE_SECONDS = 2.2
 CARD_SECONDS = 1.4
 SCENES = 3
-_VERSION = 1
+# Part of every cache key: raised when the title cards are redrawn so old previews are not shown.
+_VERSION = 2
 
 
 @dataclass

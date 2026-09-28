@@ -9,7 +9,7 @@ OUTLINE_SCHEMA = _object(title=_TEXT, points={"type": "array", "items": _object(
 SCRIPT_SCHEMA = _object(title=_TEXT, hook=_TEXT, paragraphs={"type": "array", "items": _TEXT})
 ADJUST_SCHEMA = _object(paragraphs={"type": "array", "items": _TEXT})
 SCENES_SCHEMA = _object(
-    subject_vi=_TEXT, subject_en=_TEXT,
+    subject_vi=_TEXT, subject_en=_TEXT, video_query_vi=_TEXT, video_query_en=_TEXT,
     scenes={"type": "array", "items": _object(text=_TEXT, image_query_vi=_TEXT, image_query_en=_TEXT, image_prompt=_TEXT)},
 )
 
@@ -116,8 +116,11 @@ def scenes(title: str, topic: str, narration: str, scene_count: int) -> tuple[st
   tinh thần, ý nghĩa, strategic, victory, patriotism. Nếu cảnh chỉ nói ý trừu tượng, dùng người/địa danh/sự vật
   chính của video.
 - "image_prompt": mô tả tiếng Anh cho AI vẽ tranh minh họa lịch sử của cảnh, không chứa chữ trong ảnh.
+- "video_query_vi" / "video_query_en": từ khóa tìm VIDEO tư liệu trên YouTube cho cả video, 3-6 từ, tiếng Việt và
+  tiếng Anh: tên sự kiện/địa danh + năm + từ "tư liệu"/"footage" (ví dụ "giải phóng Sài Gòn 1975 tư liệu" /
+  "Fall of Saigon 1975 footage"). Không dùng ngày tháng đứng một mình, không dùng cả câu chủ đề.
 Schema:
-{{"subject_vi": "...", "subject_en": "...",
+{{"subject_vi": "...", "subject_en": "...", "video_query_vi": "...", "video_query_en": "...",
   "scenes": [{{"text": "...", "image_query_vi": "...", "image_query_en": "...", "image_prompt": "..."}}]}}"""
     user = f"""Chủ đề: {topic}
 Tiêu đề: {title}

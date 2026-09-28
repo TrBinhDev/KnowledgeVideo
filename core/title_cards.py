@@ -3,11 +3,10 @@
 Qt shapes Vietnamese text correctly and allows richer layouts than ffmpeg drawtext.
 """
 import os
-import random
 from pathlib import Path
 
 HISTORY_TEMPLATES = {
-    "history-scroll": "Cổ thư (giấy da, tông sepia)",
+    "history-scroll": "Cổ thư (tông sepia, dấu son)",
     "history-imperial": "Hoàng triều (đỏ son, vàng kim)",
     "history-archive": "Tư liệu (đen trắng, khung phim)",
 }
@@ -72,89 +71,81 @@ def _fit_text(painter, text: str, rect, max_px: float, min_px: float, bold: bool
 
 
 def _scroll(painter, width, height, s, title, badge, label):
+    """Cổ thư: the picture stays visible and fades to dark brown; the year sits in a square red seal (Asian
+    chop style) and the cream title between two bronze rules. Replaced a parchment box with wooden rollers."""
     from PySide6.QtCore import QPointF, QRectF, Qt
     from PySide6.QtGui import QColor, QLinearGradient, QPen
 
-    body = QRectF(width * 0.08, height * 0.50, width * 0.84, height * 0.30)
-    parchment = QLinearGradient(0, body.top(), 0, body.bottom())
-    parchment.setColorAt(0, QColor("#f5e6c4"))
-    parchment.setColorAt(1, QColor("#e3c68e"))
-    painter.fillRect(body, parchment)
-    texture = random.Random(7)
-    for _ in range(70):
-        y = body.top() + texture.random() * body.height()
-        painter.setPen(QPen(QColor(139, 90, 43, texture.randint(10, 28)), 1.2 * s))
-        start = body.left() + texture.random() * body.width() * 0.6
-        painter.drawLine(QPointF(start, y), QPointF(start + body.width() * (0.15 + texture.random() * 0.35), y))
-    painter.setPen(QPen(QColor("#7a4a21"), 3 * s))
-    painter.drawRect(body.adjusted(14 * s, 14 * s, -14 * s, -14 * s))
-    painter.setPen(QPen(QColor("#7a4a21"), 1.2 * s))
-    painter.drawRect(body.adjusted(22 * s, 22 * s, -22 * s, -22 * s))
-    for y in (body.top() - 22 * s, body.bottom() - 18 * s):
-        roller = QRectF(width * 0.05, y, width * 0.90, 40 * s)
-        wood = QLinearGradient(0, roller.top(), 0, roller.bottom())
-        wood.setColorAt(0, QColor("#5c3317"))
-        wood.setColorAt(0.5, QColor("#b07a3f"))
-        wood.setColorAt(1, QColor("#5c3317"))
-        painter.setPen(Qt.NoPen)
-        painter.setBrush(wood)
-        painter.drawRoundedRect(roller, 20 * s, 20 * s)
-    painter.setPen(QColor("#8b5a2b"))
-    painter.setFont(_font(26 * s, True, 4 * s))
-    painter.drawText(QRectF(body.left(), body.top() + 40 * s, body.width(), 40 * s), Qt.AlignCenter, label)
-    painter.setPen(QColor("#3b2412"))
-    _fit_text(painter, title, QRectF(body.left() + 60 * s, body.top() + 95 * s, body.width() - 120 * s,
-                                     body.height() - 140 * s), 72 * s, 34 * s, True, Qt.AlignCenter | Qt.TextWordWrap)
+    fade = QLinearGradient(0, height * 0.38, 0, height)
+    fade.setColorAt(0, QColor(28, 16, 8, 0))
+    fade.setColorAt(0.45, QColor(28, 16, 8, 170))
+    fade.setColorAt(1, QColor(20, 11, 5, 240))
+    painter.fillRect(QRectF(0, height * 0.38, width, height * 0.62), fade)
+    bronze = QColor("#e2c48f")
+    top = height * 0.585
     if badge:
-        radius = 78 * s
-        painter.save()
-        painter.translate(body.right() - 40 * s, body.top() - 10 * s)
-        painter.rotate(-8)
-        painter.setPen(QPen(QColor("#f8e7c9"), 3 * s))
-        painter.setBrush(QColor(163, 29, 29, 235))
-        painter.drawEllipse(QRectF(-radius, -radius, radius * 2, radius * 2))
-        painter.setPen(QColor("#fff4e0"))
-        painter.setFont(_font(44 * s, True))
-        painter.drawText(QRectF(-radius, -radius, radius * 2, radius * 2), Qt.AlignCenter, badge)
-        painter.restore()
+        side = 150 * s
+        seal = QRectF(width / 2 - side / 2, top - side - 30 * s, side, side)
+        painter.setPen(Qt.NoPen)
+        painter.setBrush(QColor(168, 32, 26, 235))
+        painter.drawRoundedRect(seal, 10 * s, 10 * s)
+        painter.setPen(QPen(QColor(250, 232, 200, 220), 3 * s))
+        painter.setBrush(Qt.NoBrush)
+        painter.drawRoundedRect(seal.adjusted(10 * s, 10 * s, -10 * s, -10 * s), 6 * s, 6 * s)
+        painter.setPen(QColor("#fbe9cf"))
+        painter.setFont(_font(46 * s, True, 1 * s))
+        painter.drawText(seal, Qt.AlignCenter, badge)
+    painter.setPen(bronze)
+    painter.setFont(_font(27 * s, True, 6 * s))
+    painter.drawText(QRectF(0, top, width, 40 * s), Qt.AlignCenter, label)
+    painter.setPen(QPen(QColor("#c9a46a"), 2 * s))
+    painter.drawLine(QPointF(width * 0.18, top + 58 * s), QPointF(width * 0.82, top + 58 * s))
+    text = QRectF(width * 0.09, top + 80 * s, width * 0.82, height * 0.25)
+    flags = Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap
+    painter.setPen(QColor("#f6ead2"))
+    _fit_text(painter, title, text, 70 * s, 36 * s, True, flags)
+    below = painter.boundingRect(text, flags, title).bottom() + 28 * s
+    painter.setPen(QPen(QColor("#c9a46a"), 2 * s))
+    painter.drawLine(QPointF(width * 0.18, below), QPointF(width * 0.82, below))
 
 
 def _imperial(painter, width, height, s, title, badge, label):
+    """Hoàng triều: the picture fades to deep lacquer red; a large gold-outlined year, a thin gold divider with a
+    diamond and a pale gold title. Replaced a solid red box with double gold borders."""
     from PySide6.QtCore import QPointF, QRectF, Qt
-    from PySide6.QtGui import QColor, QLinearGradient, QPen, QPolygonF
+    from PySide6.QtGui import QColor, QFontMetricsF, QLinearGradient, QPainterPath, QPen, QPolygonF
 
-    shade = QLinearGradient(0, 0, 0, height * 0.18)
-    shade.setColorAt(0, QColor(0, 0, 0, 140))
-    shade.setColorAt(1, QColor(0, 0, 0, 0))
-    painter.fillRect(QRectF(0, 0, width, height * 0.18), shade)
-    band = QRectF(width * 0.05, height * 0.56, width * 0.90, height * 0.26)
-    painter.fillRect(band, QColor(122, 15, 20, 238))
+    fade = QLinearGradient(0, height * 0.36, 0, height)
+    fade.setColorAt(0, QColor(40, 4, 6, 0))
+    fade.setColorAt(0.45, QColor(52, 6, 9, 185))
+    fade.setColorAt(1, QColor(26, 3, 5, 245))
+    painter.fillRect(QRectF(0, height * 0.36, width, height * 0.64), fade)
     gold = QColor("#d9ad4a")
-    painter.setPen(QPen(gold, 5 * s))
-    painter.drawRect(band.adjusted(10 * s, 10 * s, -10 * s, -10 * s))
-    painter.setPen(QPen(gold, 1.6 * s))
-    painter.drawRect(band.adjusted(22 * s, 22 * s, -22 * s, -22 * s))
+    y = height * 0.555
+    painter.setPen(QColor("#f0c96a"))
+    painter.setFont(_font(27 * s, True, 6 * s))
+    painter.drawText(QRectF(0, y, width, 40 * s), Qt.AlignCenter, label)
+    y += 52 * s
+    if badge:
+        font = _font(170 * s, True, 4 * s)
+        metrics = QFontMetricsF(font)
+        path = QPainterPath()
+        path.addText(QPointF(width / 2 - metrics.horizontalAdvance(badge) / 2, y + metrics.ascent()), font, badge)
+        painter.setBrush(QColor(217, 173, 74, 60))
+        painter.setPen(QPen(gold, 3 * s))
+        painter.drawPath(path)
+        y += metrics.height() + 6 * s
+    centre, diamond = width / 2, 11 * s
+    painter.setPen(QPen(gold, 2 * s))
+    painter.drawLine(QPointF(width * 0.2, y), QPointF(centre - 26 * s, y))
+    painter.drawLine(QPointF(centre + 26 * s, y), QPointF(width * 0.8, y))
     painter.setPen(Qt.NoPen)
     painter.setBrush(gold)
-    size = 16 * s
-    for corner in (band.topLeft(), band.topRight(), band.bottomLeft(), band.bottomRight()):
-        x = corner.x() + (16 * s if corner.x() < width / 2 else -16 * s)
-        y = corner.y() + (16 * s if corner.y() < height * 0.69 else -16 * s)
-        painter.drawPolygon(QPolygonF([QPointF(x, y - size), QPointF(x + size, y), QPointF(x, y + size), QPointF(x - size, y)]))
-    painter.setPen(gold)
-    painter.setFont(_font(26 * s, True, 5 * s))
-    painter.drawText(QRectF(band.left(), band.top() + 42 * s, band.width(), 40 * s), Qt.AlignCenter, f"—  {label}  —")
-    painter.setPen(QColor("#f6d98a"))
-    _fit_text(painter, title, QRectF(band.left() + 60 * s, band.top() + 95 * s, band.width() - 120 * s,
-                                     band.height() - 130 * s), 70 * s, 32 * s, True, Qt.AlignCenter | Qt.TextWordWrap)
-    if badge:
-        pill = QRectF(width / 2 - 120 * s, band.top() - 34 * s, 240 * s, 68 * s)
-        painter.setPen(QPen(gold, 3 * s))
-        painter.setBrush(QColor(122, 15, 20, 250))
-        painter.drawRoundedRect(pill, 34 * s, 34 * s)
-        painter.setPen(QColor("#f6d98a"))
-        painter.setFont(_font(40 * s, True, 2 * s))
-        painter.drawText(pill, Qt.AlignCenter, badge)
+    painter.drawPolygon(QPolygonF([QPointF(centre, y - diamond), QPointF(centre + diamond, y),
+                                   QPointF(centre, y + diamond), QPointF(centre - diamond, y)]))
+    painter.setPen(QColor("#f7e3a6"))
+    _fit_text(painter, title, QRectF(width * 0.09, y + 34 * s, width * 0.82, height * 0.93 - (y + 34 * s)),
+              66 * s, 34 * s, True, Qt.AlignHCenter | Qt.AlignTop | Qt.TextWordWrap)
 
 
 def _archive(painter, width, height, s, title, badge, label):

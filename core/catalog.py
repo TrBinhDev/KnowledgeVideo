@@ -56,7 +56,12 @@ STYLES = {
 }
 
 # None = derived from the duration (outline_point_count).
-POINT_COUNTS = (None, 3, 4, 5, 6, 7, 8)
+POINT_COUNTS = (None, 1, 2, 3, 4, 5, 6, 7, 8)
+
+# Number of scenes: "points" = one scene per main point (paragraph), "auto" = short scenes of about 8 s
+# (scene_count), or a fixed number.
+SCENE_CHOICES = {"points": "Bằng số ý chính", "auto": "Ngắn tự động (~8 giây/cảnh)",
+                 **{count: f"{count} cảnh" for count in range(1, 13)}}
 
 SCENE_TIMINGS = {
     "sentences": "Theo câu đọc",
@@ -95,6 +100,15 @@ def style_instruction(style: str | None) -> str:
 def scene_count(duration_seconds: int) -> int:
     # About one picture every 8 s; the cap only matters for the longest (300 s) videos.
     return max(4, min(40, round(duration_seconds / 8)))
+
+
+def resolve_scene_count(choice, duration_seconds: int, main_points: int) -> int:
+    """Scenes to split the narration into, from the "Số cảnh" choice."""
+    if isinstance(choice, int) and not isinstance(choice, bool):
+        return max(1, choice)
+    if choice == "auto":
+        return scene_count(duration_seconds)
+    return max(1, min(40, main_points))
 
 
 def category_info(content_type: str, category: str) -> dict:

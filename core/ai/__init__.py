@@ -11,16 +11,20 @@ from core.ai.base import (
     ProviderResponseError,
     ProviderTimeout,
 )
-from core.ai.gemini_provider import GeminiProvider, generate_image
+from core.ai.gemini_provider import GATEWAY, GOOGLE, GeminiProvider, generate_image
 from core.ai.ollama_provider import OllamaProvider
 
-PROVIDERS = {"ollama": OllamaProvider, "gemini": GeminiProvider}
-_LISTERS = {"ollama": ollama_provider.list_models, "gemini": gemini_provider.list_models}
+# "gateway" is Gemini through a third-party API gateway (own key, address and model in KV_GATEWAY_*).
+PROVIDERS = {"ollama": OllamaProvider, "gemini": GeminiProvider, "gateway": GeminiProvider}
+_GEMINI_ENDPOINTS = {"gemini": GOOGLE, "gateway": GATEWAY}
+_LISTERS = {"ollama": ollama_provider.list_models,
+            "gemini": lambda: gemini_provider.list_models(GOOGLE),
+            "gateway": lambda: gemini_provider.list_models(GATEWAY)}
 
 
 def default_model(name: str) -> str:
-    if name == "gemini":
-        return os.environ.get("KV_GEMINI_MODEL") or gemini_provider.DEFAULT_MODEL
+    if name in _GEMINI_ENDPOINTS:
+        return _GEMINI_ENDPOINTS[name].default_model()
     return os.environ.get("KV_OLLAMA_MODEL") or ollama_provider.DEFAULT_MODEL
 
 
@@ -33,8 +37,8 @@ def list_models(name: str) -> list[str]:
 
 def build_provider(name: str, model: str | None = None, fallback_models: list[str] | None = None) -> BaseAIProvider:
     """Only Gemini uses fallback models: a local Ollama server is never "overloaded" by Google."""
-    if name == "gemini":
-        return GeminiProvider(model=model, fallback_models=fallback_models)
+    if name in _GEMINI_ENDPOINTS:
+        return GeminiProvider(model=model, fallback_models=fallback_models, endpoint=_GEMINI_ENDPOINTS[name])
     if name == "ollama":
         return OllamaProvider(model=model)
     raise ProviderNotConfigured(f"AI provider không hỗ trợ: {name}")

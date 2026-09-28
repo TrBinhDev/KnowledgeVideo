@@ -1,12 +1,13 @@
 import html
 import json
+import logging
 import re
 import threading
 import time
 from datetime import datetime
 from pathlib import Path
 
-from PySide6.QtCore import QSize, QStandardPaths, Qt, QTimer, QUrl
+from PySide6.QtCore import QObject, QSize, QStandardPaths, Qt, QTimer, QUrl, Signal
 from PySide6.QtGui import QDesktopServices, QGuiApplication, QIcon, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
@@ -23,12 +24,12 @@ from core.preview import SCENES, render_preview, render_thumbnail, run_source
 from core.render import _source_label, build_snapshot, export_video, import_music, make_thumbnail, render_video
 from core.video_pipeline import transition_names
 from ui import icons
-from ui.clip_page import ClipPage
+from ui.clip_page import VISION_CHOICES, ClipPage
 from ui.history_page import HistoryPage
 from ui.settings_page import SettingsPage
 from ui.templates_page import TemplatesPage
 from ui.widgets import Card, ChoiceCards, RenderProgress, Stepper, label, repolish
-from ui.worker import TaskThread
+from ui.worker import TaskThread, scaled_progress
 
 STEPS = (
     ("Nội dung", "Loại nội dung & từ khóa"),
@@ -51,6 +52,8 @@ FLOW_TEXTS = {
                  "tài liệu) để làm video bám theo đúng tài liệu đó."),
         "example": "Ví dụ: trận Bạch Đằng, nhà Trần chống quân Nguyên",
         "hint": "Gợi ý: tên trận đánh, triều đại, nhân vật, sự kiện hoặc mốc năm cụ thể.",
+        "scenes": "Mỗi cảnh là 1 ảnh: ít cảnh thì mỗi ảnh đứng lâu. Video 60 giây nên từ 6 cảnh trở lên "
+                  "(\"Ngắn tự động\" ra khoảng 8 cảnh).",
     },
     "clip": {
         "icon": "film", "title": "Video clip",
@@ -61,6 +64,8 @@ FLOW_TEXTS = {
         "example": "Ví dụ: chiến dịch Điện Biên Phủ 1954, Vịnh Hạ Long",
         "hint": "Nên chọn chủ đề có nhiều cảnh quay thật: trận đánh có phim tư liệu, địa danh, lễ hội, thiên nhiên. "
                 "Chủ đề quá xưa (trước thế kỷ 20) thường chỉ có tranh vẽ, 3D.",
+        "scenes": "Mỗi cảnh là 1 đoạn liền cắt từ video nguồn, dài đúng bằng cảnh. Ví dụ 60 giây, 3 cảnh = 3 đoạn "
+                  "~20 giây; video nguồn nên dài hơn tổng các đoạn.",
     },
 }
 SOURCE_LABELS = {
@@ -147,6 +152,30 @@ def _folder_size(path: Path) -> int:
         return 0
 
 
+MAX_LOG_LINES = 3000
+
+
+class _LogBridge(QObject):
+    """Carries app log records from worker threads to the GUI thread (a queued signal)."""
+
+    message = Signal(str)
+
+
+class _UiLogHandler(logging.Handler):
+    """Shows the app's own log (kv.*: AI calls, skipped videos, clip cuts...) in the Nhật ký panel too."""
+
+    def __init__(self, bridge: _LogBridge):
+        super().__init__(logging.INFO)
+        self.bridge = bridge
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            level = "" if record.levelno == logging.INFO else f"{record.levelname} "
+            self.bridge.message.emit(f"      · {level}{record.name.removeprefix('kv.')}: {record.getMessage()}")
+        except Exception:  # a log line must never break the app
+            pass
+
+
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
@@ -157,6 +186,9 @@ class MainWindow(QMainWindow):
         # "image": scenes are pictures; "clip": scenes are shots of one source video.
         self.kind = "image"
         self.task: TaskThread | None = None
+        self.task_worker: dict = {}
+        self.running_tasks: set = set()
+        self.job_number = 0
         self.busy = False
         self.reached = 0
         self.render_active = False
@@ -318,17 +350,37 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.log_toggle = _button("Nhật ký", "link")
         self.log_toggle.setCheckable(True)
+        self.log_copy = _button("Copy", "link")
+        self.log_copy.setToolTip("Copy toàn bộ nhật ký (để gửi khi báo lỗi).")
+        self.log_clear = _button("Xóa", "link")
+        self.job_cancel = _button("Hủy", "soft")
+        self.job_cancel.setToolTip("Dừng việc đang chạy và mở khóa trang ngay.")
+        self.job_cancel.setVisible(False)
+        self.job_cancel.clicked.connect(self._cancel_job)
         row.addWidget(self.status, 1)
         row.addWidget(self.elapsed)
         row.addWidget(self.progress)
+        row.addWidget(self.job_cancel)
         row.addWidget(self.log_toggle)
+        row.addWidget(self.log_copy)
+        row.addWidget(self.log_clear)
         self.timeline = QListWidget()
         self.timeline.setObjectName("timeline")
-        self.timeline.setFixedHeight(110)
+        self.timeline.setFixedHeight(280)
         self.timeline.setVisible(False)
-        self.log_toggle.toggled.connect(self.timeline.setVisible)
+        for widget in (self.log_copy, self.log_clear):
+            widget.setVisible(False)
+        self.log_toggle.toggled.connect(self._toggle_log)
+        self.log_copy.clicked.connect(
+            lambda: QGuiApplication.clipboard().setText(
+                "\n".join(self.timeline.item(index).text() for index in range(self.timeline.count()))))
+        self.log_clear.clicked.connect(self.timeline.clear)
         layout.addLayout(row)
         layout.addWidget(self.timeline)
+        self.log_bridge = _LogBridge(self)
+        self.log_bridge.message.connect(self._log_raw)
+        self.log_handler = _UiLogHandler(self.log_bridge)
+        logging.getLogger("kv").addHandler(self.log_handler)
         self.elapsed_timer = QTimer(self)
         self.elapsed_timer.setInterval(500)
         self.elapsed_timer.timeout.connect(self._tick)
@@ -409,6 +461,7 @@ class MainWindow(QMainWindow):
         self.source_card.subtitle.setText(texts["card"][1])
         self.input_edit.setPlaceholderText(texts["example"])
         self.keyword_hint.setText(texts["hint"])
+        self.scenes_hint.setText(texts["scenes"])
         self.clip_link_box.setVisible(kind == "clip")
 
     def _on_settings_saved(self) -> None:
@@ -526,6 +579,8 @@ class MainWindow(QMainWindow):
             self.model_combo.addItem(state.get("model") or default_model(state["provider"]))
         self.style_combo.setCurrentIndex(max(0, self.style_combo.findData(state.get("style"))))
         self.points_combo.setCurrentIndex(max(0, self.points_combo.findData(state.get("points"))))
+        # Runs saved before this choice existed used short automatic scenes.
+        self.scenes_combo.setCurrentIndex(max(0, self.scenes_combo.findData(state.get("scene_choice", "auto"))))
         from_source = state.get("mode") in ("source_ai", "source_verbatim")
         if from_source:
             self.source_edit.setPlainText(state.get("source", ""))
@@ -535,11 +590,23 @@ class MainWindow(QMainWindow):
         self.input_tabs.button(1 if from_source else 0).setChecked(True)
         self._show_input_tab(1 if from_source else 0)
         self.clip_link_edit.setText(state.get("clip_link", ""))
+        self.set_vision_choice(state.get("vision_ai", "same"))
 
     # ---------- progress and background work ----------
 
+    def _toggle_log(self, visible: bool) -> None:
+        for widget in (self.timeline, self.log_copy, self.log_clear):
+            widget.setVisible(visible)
+        if visible:
+            self.timeline.scrollToBottom()
+
     def _log(self, text: str) -> None:
-        self.timeline.addItem(f"{datetime.now():%H:%M:%S}  {text}")
+        self._log_raw(f"{datetime.now():%H:%M:%S}  {text}")
+
+    def _log_raw(self, line: str) -> None:
+        self.timeline.addItem(line)
+        while self.timeline.count() > MAX_LOG_LINES:
+            self.timeline.takeItem(0)
         self.timeline.scrollToBottom()
 
     def _tick(self) -> None:
@@ -555,6 +622,7 @@ class MainWindow(QMainWindow):
         if label_text != self.current_stage:
             self._close_stage()
             self.current_stage, self.stage_started_at = label_text, time.monotonic()
+            self._log(f"  → {label_text}" + (f" ({percent}%)" if percent >= 0 else ""))
         if self.render_active:
             self.render_panel.update_stage(stage, percent, label_text)
         if percent < 0:
@@ -566,24 +634,56 @@ class MainWindow(QMainWindow):
         self.progress.setValue(percent)
         self.status.setText(f"{label_text} — {percent}%")
 
-    def _run(self, message: str, job, on_success) -> None:
+    def _run(self, message: str, job, on_success, cancellable: bool = False) -> None:
+        """Run `job` in a worker thread. A cancellable job shows "Hủy": the page unlocks at once and the job stops
+        at its next check (a running AI call finishes in the background first); its result is then ignored."""
         # A flag rather than isRunning(): success callbacks may start the next job while the old thread is still exiting.
         if self.busy:
             return
         self.busy = True
+        self.job_number += 1
+        number = self.job_number
         self._set_busy(True, message)
         # AI calls report no progress, so the bar stays in "busy" mode until a job emits a percentage.
         self.progress.setRange(0, 0)
         self.started_at = time.monotonic()
         self._log(f"Bắt đầu: {message}")
         self.elapsed_timer.start()
-        self.task = TaskThread(job, self)
-        self.task.progress.connect(self._on_progress)
-        self.task.succeeded.connect(lambda result: (self._finish(True, "Xong"), on_success(result)))
-        self.task.failed.connect(self._on_failed)
-        self.task.start()
+        worker: dict = {}
+
+        def tracked(progress):
+            worker["id"] = threading.get_ident()
+            try:
+                return job(progress)
+            finally:
+                video_pipeline.clear_cancel(worker["id"])
+
+        def current() -> bool:
+            return number == self.job_number
+
+        task = TaskThread(tracked, self)
+        self.task, self.task_worker = task, worker
+        # Signals of a cancelled job (an older job number) are ignored.
+        task.progress.connect(lambda stage, percent: current() and self._on_progress(stage, percent))
+        task.succeeded.connect(lambda result: current() and (self._finish(True, "Xong"), on_success(result)))
+        task.failed.connect(lambda error: current() and self._on_failed(error))
+        # Keep a reference until the thread really ends, also after a cancel.
+        self.running_tasks.add(task)
+        task.finished.connect(lambda: self.running_tasks.discard(task))
+        self.job_cancel.setVisible(cancellable)
+        task.start()
+
+    def _cancel_job(self) -> None:
+        if not self.busy or self.render_active:
+            return
+        if "id" in self.task_worker:
+            video_pipeline.cancel_thread(self.task_worker["id"])
+        self.job_number += 1
+        self._log("Đã hủy theo yêu cầu (việc đang chạy dở sẽ tự dừng ở nền)")
+        self._finish(False, "Đã hủy")
 
     def _finish(self, ok: bool, text: str) -> None:
+        self.job_cancel.setVisible(False)
         self.busy = False
         self._close_stage()
         self.elapsed_timer.stop()
@@ -630,6 +730,40 @@ class MainWindow(QMainWindow):
         def job(progress):
             provider.notify = progress
             return call(provider)
+
+        return job
+
+    def set_vision_choice(self, choice: str) -> None:
+        """One choice shown in two places (step 1 and step 4); saved with the video."""
+        choice = choice if choice in VISION_CHOICES else "same"
+        for combo in (self.vision_combo, self.clip_page.vision_combo):
+            if combo.currentData() != choice:
+                combo.blockSignals(True)
+                combo.setCurrentIndex(combo.findData(choice))
+                combo.blockSignals(False)
+        if self.state.get("vision_ai", "same") != choice:
+            self.state["vision_ai"] = choice
+            self._save()
+
+    def _step4_job(self, call):
+        """AI for the clip flow's step 4, from "AI xem hình & chọn đoạn": `call(provider, vision)` runs in the worker,
+        with `provider` choosing segments and `vision(prompt, images, schema)` looking at frames."""
+        choice = self.state.get("vision_ai", "same")
+        if choice == "same":
+            name = self.provider_cards.currentData()
+            model = self.model_combo.currentText().strip() or default_model(name)
+            fallbacks = [self.model_combo.itemText(index) for index in range(self.model_combo.count())
+                         if self.model_combo.itemText(index) != model][:8]
+        else:
+            name, model, fallbacks = choice, default_model(choice), []
+        provider = build_provider(name, model, fallbacks)
+        # Ollama looks with its vision model (KV_VISION_MODEL); the chosen Ollama text model may not see images.
+        vision = clips.ollama_vision if name == "ollama" else clips.gemini_vision(provider)
+        self._log(f"AI bước 4: {VISION_CHOICES.get(name, name)} · {model}")
+
+        def job(progress):
+            provider.notify = progress
+            return call(provider, vision)
 
         return job
 
@@ -698,10 +832,12 @@ class MainWindow(QMainWindow):
 
         ai = Card("AI viết nội dung", "Model chọn ở đây dùng cho mọi bước AI sau. Gemini quá tải sẽ tự thử "
                   "các model khác trong danh sách.", "sparkles")
-        self.provider_cards = ChoiceCards(columns=2)
+        self.provider_cards = ChoiceCards(columns=3)
         self.provider_cards.addItem("Gemini", "gemini", "Google, cần API key (bản free dùng được)", "sparkles")
+        self.provider_cards.addItem("Gemini qua cổng API", "gateway",
+                                    "Key và địa chỉ riêng (KV_GATEWAY_*), ví dụ shopaikey", "sparkles")
         self.provider_cards.addItem("Ollama", "ollama", "Chạy trên máy, không cần mạng cho AI", "chip")
-        self.provider_cards.setCurrentIndex(1)
+        self.provider_cards.setCurrentIndex(self.provider_cards.findData("ollama"))
         self.model_combo = QComboBox()
         self.model_combo.setEditable(True)
         self.model_combo.addItem(default_model("ollama"))
@@ -735,10 +871,19 @@ class MainWindow(QMainWindow):
         self.points_combo = QComboBox()
         for count in catalog.POINT_COUNTS:
             self.points_combo.addItem("Tự động theo độ dài" if count is None else f"{count} ý", count)
+        self.scenes_combo = QComboBox()
+        for key, name in catalog.SCENE_CHOICES.items():
+            self.scenes_combo.addItem(name, key)
+        self.scenes_combo.setToolTip("Bằng số ý chính: mỗi ý của đề cương là 1 cảnh. Ngắn tự động: khoảng 8 giây "
+                                     "một cảnh. Hoặc chọn số cảnh cố định.")
+        self.scenes_hint = _hint("")
         settings.addWidget(_field("Phong cách lời kể"), 2, 0)
         settings.addWidget(_field("Số ý chính"), 2, 2)
+        settings.addWidget(_field("Số cảnh"), 2, 3)
         settings.addWidget(self.style_combo, 3, 0, 1, 2)
         settings.addWidget(self.points_combo, 3, 2)
+        settings.addWidget(self.scenes_combo, 3, 3)
+        settings.addWidget(self.scenes_hint, 4, 0, 1, 4)
         settings.setColumnStretch(0, 3)
         settings.setColumnStretch(2, 2)
         settings.setColumnStretch(3, 2)
@@ -826,6 +971,16 @@ class MainWindow(QMainWindow):
         link_layout.addWidget(self.clip_link_edit)
         link_layout.addWidget(_hint("Có link: đến bước Cảnh & clip app dùng luôn video này. Để trống: ở bước đó app "
                                     "tìm video Creative Commons theo chủ đề."))
+        vision_row = QHBoxLayout()
+        vision_row.addWidget(_field("AI xem hình & chọn đoạn (bước 4)"))
+        self.vision_combo = QComboBox()
+        for key, name in VISION_CHOICES.items():
+            self.vision_combo.addItem(name, key)
+        self.vision_combo.setToolTip("AI xem khung hình (phân loại video, mô tả shot) và chọn đoạn cho từng cảnh. "
+                                     "Gemini nhanh và mô tả đúng hơn nhưng tốn token; Ollama miễn phí, chậm hơn.")
+        self.vision_combo.currentIndexChanged.connect(lambda _index: self.set_vision_choice(self.vision_combo.currentData()))
+        vision_row.addWidget(self.vision_combo, 1)
+        link_layout.addLayout(vision_row)
         # Above the tabs: it must be filled before pressing the tab's start button.
         source.body.insertWidget(0, self.clip_link_box)
         return _scroll(self._build_flow_banner(), kind, ai, source)
@@ -864,11 +1019,13 @@ class MainWindow(QMainWindow):
                 QMessageBox.information(self, "Link video nguồn chưa đúng", str(error))
                 return False
         self.state["clip_link"] = link
+        self.state["vision_ai"] = self.vision_combo.currentData()
         self.state.update({
             "kind": self.kind,
             "content_type": self.type_cards.currentData(), "category": self.category_cards.currentData(),
             "duration": duration, "voice": self.script_voice_combo.currentData(),
             "style": self.style_combo.currentData(), "points": self.points_combo.currentData(),
+            "scene_choice": self.scenes_combo.currentData(),
         })
         return True
 
@@ -1228,8 +1385,8 @@ class MainWindow(QMainWindow):
         duration = self.state["duration"]
         points = self._outline_points()
         title = self.outline_title.text().strip() or self.state["topic"]
-        if len(points) < 2:
-            QMessageBox.information(self, "Đề cương quá ngắn", "Đề cương cần ít nhất 2 ý.")
+        if not points:
+            QMessageBox.information(self, "Đề cương trống", "Đề cương cần ít nhất 1 ý.")
             return
         self.state["outline"] = {"title": title, "points": points, "approved": True}
         self._save()
@@ -1240,10 +1397,14 @@ class MainWindow(QMainWindow):
         voice = self._voice()
 
         def write_and_fit(provider):
+            # Writing is one AI call (no progress inside it); fitting the length reports its own phases.
+            progress = provider.notify
+            progress("AI viết lời đọc theo đề cương", 3)
             script = steps.write_script(provider, state["content_type"], state["category"], state["topic"], title, points,
                                         state.get("style"), state.get("source", ""))
+            progress(f"Đã viết xong: {steps.word_count(script['hook']) + steps.word_count(script['body'])} từ", 40)
             return steps.fit_script_duration(provider, state["content_type"], state["category"], script,
-                                             duration, voice, provider.notify, state.get("style"))
+                                             duration, voice, scaled_progress(progress, 40, 100), state.get("style"))
 
         self._run("AI đang viết kịch bản và canh thời lượng...", self._ai_job(write_and_fit), self._show_script)
 
@@ -1325,18 +1486,20 @@ class MainWindow(QMainWindow):
         target = self.state.get("duration", 0)
         fitted = (self.state.get("script") or {}).get("timing")
         if fitted and fitted.get("narration") == timing.narration({"hook": hook, "body": body}):
+            allowed = timing.tolerance(target)
             if fitted["within_tolerance"]:
-                status = "khớp"
+                status = f"khớp (cho phép ±{allowed:.0f}s)"
             elif self.state.get("outline"):
-                status = f"lệch quá {timing.TOLERANCE_SECONDS:.0f}s, nên Viết lại"
+                status = f"lệch quá {allowed:.0f}s, nên Viết lại"
             else:
                 # Text used as written is never rewritten by the AI; only the user can change its length.
                 direction = "ngắn" if fitted["seconds"] < target else "dài"
-                status = (f"{direction} hơn mục tiêu quá {timing.TOLERANCE_SECONDS:.0f}s: sửa thêm/bớt nội dung "
+                status = (f"{direction} hơn mục tiêu quá {allowed:.0f}s: sửa thêm/bớt nội dung "
                           "(Chỉnh sửa) rồi Đo lại, hoặc cứ render với độ dài này")
+            # The length at the chosen rate is computed from the measured one (not read aloud again).
             self.script_stats.setText(
-                f"{words} từ — đo thật: {fitted['seconds']}s (tốc độ đọc {fitted['tts_rate']}) / "
-                f"mục tiêu {target}s — {status}")
+                f"{words} từ — đo thật {fitted.get('base_seconds', fitted['seconds'])}s, với tốc độ đọc "
+                f"{fitted['tts_rate']} ~{fitted['seconds']}s / mục tiêu {target}s — {status}")
         else:
             self.script_stats.setText(
                 f"{words} từ, ước tính ~{steps.estimated_seconds(hook, body)}s / mục tiêu {target}s — "
@@ -1350,9 +1513,12 @@ class MainWindow(QMainWindow):
         self.state["script"] = {**self.state.get("script", {}), **script, "approved": True}
         self._save()
         duration, topic = self.state["duration"], self.state.get("topic", "")
-        self._run("AI đang chia cảnh...",
+        # "Main points" are the outline points, or the paragraphs when the script came without an outline.
+        points = len((self.state.get("outline") or {}).get("points") or []) or steps.paragraph_count(script["body"])
+        count = catalog.resolve_scene_count(self.state.get("scene_choice", "auto"), duration, points)
+        self._run(f"AI đang chia cảnh ({count} cảnh)...",
                   self._ai_job(lambda provider: steps.split_scenes(provider, script["title"], topic, script["hook"],
-                                                                   script["body"], duration, provider.notify)),
+                                                                   script["body"], duration, provider.notify, count)),
                   self._show_scenes)
 
     # ---------- step 4: scenes and images ----------
@@ -1431,6 +1597,9 @@ class MainWindow(QMainWindow):
     def _show_scenes(self, result: dict) -> None:
         self.state["image_subject"] = result["subject"]
         self.state["scenes"] = result["scenes"]
+        # Source-video search keywords for the clip flow (from the same AI call); the old query is replaced.
+        self.state["video_query"] = result.get("video_query") or {}
+        self.state.pop("clip_query", None)
         # Shown together with the image search messages, which follow right away.
         self.scene_warnings = list(result.get("warnings") or [])
         self._save()
@@ -2045,6 +2214,10 @@ class MainWindow(QMainWindow):
     def _scroll_to(self, widget: QWidget) -> None:
         # After the layout has placed the newly shown widget.
         QTimer.singleShot(50, lambda: self.pages.widget(RENDER).ensureWidgetVisible(widget, 0, 16))
+
+    def closeEvent(self, event):
+        logging.getLogger("kv").removeHandler(self.log_handler)
+        super().closeEvent(event)
 
     def _open(self, path: str | None) -> None:
         if path and Path(path).exists():

@@ -17,12 +17,18 @@ AI_FIELDS = (
     ("KV_GEMINI_API_KEY", "Gemini API key", "Lấy ở Google AI Studio. Lưu trong file .env trên máy này."),
     ("KV_GEMINI_MODEL", "Gemini model mặc định", "Ví dụ gemini-3.8-flash. Trong app vẫn chọn được model khác."),
     ("KV_GEMINI_IMAGE_MODEL", "Gemini model tạo ảnh", "Chỉ dùng cho nút \"Ảnh AI (Gemini)\"; cần key có billing."),
+    ("KV_GATEWAY_API_KEY", "Cổng API: key", "Key của cổng API bên thứ ba (ví dụ shopaikey) cho lựa chọn "
+                                             "\"Gemini qua cổng API\". Gửi dạng Authorization: Bearer."),
+    ("KV_GATEWAY_BASE_URL", "Cổng API: địa chỉ", "Địa chỉ định dạng Gemini, ví dụ https://api.shopaikey.com/v1beta "
+                                                 "(không dùng địa chỉ /v1 kiểu OpenAI)."),
+    ("KV_GATEWAY_MODEL", "Cổng API: model mặc định", "Ví dụ gemini-2.5-flash. Trong app vẫn chọn được model khác."),
     ("KV_OLLAMA_URL", "Ollama URL", "Mặc định http://127.0.0.1:11434"),
     ("KV_OLLAMA_MODEL", "Ollama model mặc định", "Ví dụ gemma3"),
     ("KV_OLLAMA_TIMEOUT_SECONDS", "Ollama timeout (giây)", "Model chạy trên máy có thể chậm; mặc định 240."),
     ("KV_VISION_MODEL", "Ollama model xem ảnh (video clip)",
      "Xem khung hình video nguồn: loại nội dung, mô tả shot. Cần model có thị giác; mặc định gemma3."),
 )
+SECRET_FIELDS = ("KV_GEMINI_API_KEY", "KV_GATEWAY_API_KEY")
 OTHER_FIELDS = (
     ("KV_OUTPUT_DIR", "Thư mục lưu video", "Để trống: thư mục output trong project."),
     ("KV_CLIP_CACHE_MB", "Giới hạn cache video nguồn (MB)",
@@ -47,7 +53,8 @@ class SettingsPage(QWidget):
         ai.actions.addWidget(show)
         other = Card("Lưu trữ & video", "", "sliders")
         other.body.addLayout(self._grid(OTHER_FIELDS))
-        self.fields["KV_GEMINI_API_KEY"].setEchoMode(QLineEdit.Password)
+        for key in SECRET_FIELDS:
+            self.fields[key].setEchoMode(QLineEdit.Password)
         save = QPushButton("Lưu cài đặt")
         save.setObjectName("primary")
         save.setIcon(icons.icon("check", "#ffffff", 16))
@@ -91,7 +98,8 @@ class SettingsPage(QWidget):
         return grid
 
     def _toggle_key(self, visible: bool) -> None:
-        self.fields["KV_GEMINI_API_KEY"].setEchoMode(QLineEdit.Normal if visible else QLineEdit.Password)
+        for key in SECRET_FIELDS:
+            self.fields[key].setEchoMode(QLineEdit.Normal if visible else QLineEdit.Password)
         self.show_key.setText("Ẩn key" if visible else "Hiện key")
 
     def _browse(self, key: str) -> None:
@@ -121,6 +129,9 @@ class SettingsPage(QWidget):
         problems = []
         if values["KV_OLLAMA_URL"] and not values["KV_OLLAMA_URL"].startswith(("http://", "https://")):
             problems.append("Ollama URL phải bắt đầu bằng http:// hoặc https://.")
+        gateway = values["KV_GATEWAY_BASE_URL"]
+        if gateway and not gateway.startswith("https://"):
+            problems.append("Địa chỉ cổng API phải bắt đầu bằng https:// (key được gửi kèm mỗi lần gọi).")
         timeout = values["KV_OLLAMA_TIMEOUT_SECONDS"]
         if timeout and not (timeout.replace(".", "", 1).isdigit() and float(timeout) > 0):
             problems.append("Ollama timeout phải là số giây lớn hơn 0.")

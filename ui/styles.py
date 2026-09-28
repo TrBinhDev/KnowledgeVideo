@@ -121,6 +121,7 @@ QLabel#status { color: #475569; }
 QProgressBar#thinBar { background: #e2e8f0; border: none; border-radius: 3px; max-height: 6px; }
 QProgressBar#thinBar::chunk { background: #2563eb; border-radius: 3px; }
 QListWidget#timeline { font-family: "Consolas"; font-size: 8.5pt; color: #334155; background: #f8fafc; }
+QListWidget#timeline::item { padding: 1px 4px; border-radius: 0; }
 
 /* scroll bars */
 QScrollBar:vertical { background: transparent; width: 10px; margin: 2px; }

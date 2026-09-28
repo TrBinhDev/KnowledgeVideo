@@ -85,7 +85,8 @@ def build_snapshot(state: dict, render_options: dict, music_file: str, tts_rate:
         "source_name": source_name,
         "title_badge": _year_badge(script["title"], state.get("topic", "")),
         "title_label": _content_label(state),
-        "template_options": {"show_source": True, "show_title_card": True, "title_position": "top"},
+        # No "Nguồn: ..." line on the video: the credits go in the post caption (credits.txt, "Copy ghi nguồn").
+        "template_options": {"show_source": False, "show_title_card": True, "title_position": "top"},
     }
 
 

@@ -34,8 +34,9 @@ def suggest_topics(provider: BaseAIProvider, content_type: str, category: str, u
 
 
 MIN_POINT_SECONDS = 3
-# Beyond this relative gap the speaking rate (±10%) cannot close it, so the AI rewrites the length first.
-REWRITE_THRESHOLD = 0.08
+# The speaking rate closes a gap of up to 10%, and 5% is allowed (timing.tolerance), so the AI rewrites the
+# length only beyond 15%.
+REWRITE_THRESHOLD = timing.MAX_RATE_PERCENT / 100 + timing.TOLERANCE_SHARE
 MAX_REWRITES = 2
 
 
@@ -80,7 +81,7 @@ def make_outline(provider: BaseAIProvider, content_type: str, category: str, top
         seconds = point.get("seconds") if isinstance(point, dict) else None
         if text:
             items.append((seconds if isinstance(seconds, int) and not isinstance(seconds, bool) else None, text))
-    if len(items) < 2:
+    if len(items) < min(2, point_count):
         raise ProviderResponseError("Đề cương AI trả về quá ít ý. Hãy tạo lại.")
     # AI arithmetic is unreliable, so the budget is always rebalanced to the requested duration.
     seconds = normalize_seconds([value for value, _ in items], duration_seconds)
@@ -135,27 +136,40 @@ def fit_script_duration(provider: BaseAIProvider | None, content_type: str, cate
 
     Passing provider=None keeps the text untouched (used after manual edits and before rendering).
     """
-    def report(message: str) -> None:
+    def report(message: str, percent: int = -1) -> None:
         if progress:
-            progress(message, -1)
+            progress(message, percent)
 
+    # At most two real measurements (each reads the whole script aloud, minutes for long videos): one at the start,
+    # and one more only if the AI rewrote the script. Rewrites in between are judged by an estimate from the
+    # measured words per second of this voice and text.
+    report("Đo giọng đọc (Edge TTS)", 2)
     seconds = timing.measure(timing.narration(script), voice)
-    report(f"Đo giọng đọc: {seconds:.1f}s / mục tiêu {target_seconds}s")
+    words_per_second = max(0.5, word_count(timing.narration(script)) / max(1.0, seconds))
+    report(f"Đo giọng đọc: {seconds:.1f}s / mục tiêu {target_seconds}s", 30)
+    estimate, rewritten = seconds, False
     for attempt in range(MAX_REWRITES if provider else 0):
-        if abs(seconds / target_seconds - 1) <= REWRITE_THRESHOLD:
+        if abs(estimate / target_seconds - 1) <= REWRITE_THRESHOLD:
             break
-        direction = "kéo dài" if seconds < target_seconds else "rút ngắn"
-        report(f"AI {direction} kịch bản (lần {attempt + 1})")
+        direction = "kéo dài" if estimate < target_seconds else "rút ngắn"
+        report(f"AI {direction} kịch bản (lần {attempt + 1})", 35 + 20 * attempt)
         try:
-            script = adjust_length(provider, content_type, category, script, target_seconds / seconds, style)
+            script = adjust_length(provider, content_type, category, script, target_seconds / estimate, style)
         except (ProviderResponseError, ProviderTimeout) as error:
             # Keep the script already written (and measured) rather than losing it; the rate still adjusts it.
             logger.warning("adjust_length_failed attempt=%d reason=%s", attempt + 1, error)
             report("AI chỉnh độ dài không thành công, giữ bản kịch bản hiện có")
             break
+        rewritten = True
+        estimate = word_count(timing.narration(script)) / words_per_second
+        report(f"Ước lượng sau khi viết lại: ~{estimate:.1f}s", 50 + 20 * attempt)
+    if rewritten:
+        report("Đo lại giọng đọc bản đã viết lại", 80)
         seconds = timing.measure(timing.narration(script), voice)
-        report(f"Đo lại: {seconds:.1f}s")
+        logger.info("fit_estimate_check estimated=%.1fs measured=%.1fs", estimate, seconds)
+    report("Tính tốc độ đọc cho khớp thời lượng", 92)
     fitted = timing.fit_rate(timing.narration(script), voice, target_seconds, progress, measured_seconds=seconds)
+    report(f"Canh thời lượng xong: ~{fitted['seconds']}s (tốc độ {fitted['tts_rate']})", 100)
     return {**script, "timing": fitted}
 
 
@@ -201,37 +215,75 @@ def _share_scenes(parts: list[str], count: int) -> list[int]:
     return shares
 
 
+_SENTENCE_END = re.compile(r"(?<=[.!?…])\s+")
+
+
+def _halves(text: str) -> tuple[str, str]:
+    """Split a scene's narration in two near the middle, at a sentence end when there is one."""
+    sentences = _SENTENCE_END.split(text.strip())
+    if len(sentences) >= 2:
+        sizes = [len(sentence) for sentence in sentences]
+        cut = min(range(1, len(sentences)), key=lambda index: abs(sum(sizes[:index]) - sum(sizes) / 2))
+        return " ".join(sentences[:cut]), " ".join(sentences[cut:])
+    words = text.split()
+    if len(words) < 6:
+        return text, ""
+    return " ".join(words[:len(words) // 2]), " ".join(words[len(words) // 2:])
+
+
+def fit_scene_count(scenes: list[dict], count: int) -> list[dict]:
+    """Exactly `count` scenes: small models return more or fewer than asked, so neighbours are merged (the
+    shortest pair first) or the longest scene is halved, keeping the narration order."""
+    scenes = [dict(scene) for scene in scenes]
+    while len(scenes) > max(1, count):
+        index = min(range(len(scenes) - 1), key=lambda k: len(scenes[k]["text"]) + len(scenes[k + 1]["text"]))
+        first, second = scenes[index], scenes[index + 1]
+        scenes[index:index + 2] = [{**first, "text": f"{first['text']} {second['text']}"}]
+    while len(scenes) < count:
+        index = max(range(len(scenes)), key=lambda k: len(scenes[k]["text"]))
+        left, right = _halves(scenes[index]["text"])
+        if not right:
+            break
+        scenes[index:index + 1] = [{**scenes[index], "text": left}, {**scenes[index], "text": right}]
+    return scenes
+
+
 def split_scenes(provider: BaseAIProvider, title: str, topic: str, hook: str, body: str,
-                 duration_seconds: int, progress=None) -> dict:
+                 duration_seconds: int, progress=None, count: int | None = None) -> dict:
     """Returns {"subject": {"vi", "en"}, "scenes": [...], "warnings": [...]}.
 
-    Each scene carries Vietnamese and English image keywords. Long videos are split one paragraph at a time;
-    a paragraph the AI cannot split becomes a single scene with the video's main keywords (listed in warnings).
+    `count` is the number of scenes wanted (None: about one every 8 s). Each scene carries Vietnamese and English
+    image keywords. Long videos are split one paragraph at a time; a paragraph the AI cannot split becomes a single
+    scene with the video's main keywords (listed in warnings).
     """
-    count = catalog.scene_count(duration_seconds)
+    count = count or catalog.scene_count(duration_seconds)
     if count <= SINGLE_CALL_SCENES:
         data = provider.generate_json(*prompts.scenes(title, topic, f"{hook}\n\n{body}", count),
                                       prompts.SCENES_SCHEMA, temperature=0.4)
         subject = {"vi": _clean(data.get("subject_vi")), "en": _clean(data.get("subject_en"))}
         scenes = _parse_scenes(data, subject, title)
-        if len(scenes) < 2:
+        if len(scenes) < min(2, count):
             raise ProviderResponseError("AI chia cảnh không hợp lệ. Hãy chia lại.")
         if len(scenes) != count:
-            logger.info("scene_count_mismatch expected=%d got=%d", count, len(scenes))
-        return {"subject": subject, "scenes": scenes, "warnings": []}
+            logger.info("scene_count_mismatch expected=%d got=%d (fitted)", count, len(scenes))
+            scenes = fit_scene_count(scenes, count)
+        return {"subject": subject, "scenes": scenes, "warnings": [], "video_query": _video_query(data, subject)}
 
     parts = [hook] + _paragraphs(body)
     shares = _share_scenes(parts, count)
     subject = {"vi": "", "en": ""}
+    video_query = {"vi": "", "en": ""}
     scenes, warnings = [], []
     for number, (part, share) in enumerate(zip(parts, shares), 1):
         if progress:
-            progress(f"Chia cảnh phần {number}/{len(parts)}", -1)
+            progress(f"Chia cảnh phần {number}/{len(parts)}", round(100 * (number - 1) / len(parts)))
         try:
             data = provider.generate_json(*prompts.scenes(title, topic, part, share), prompts.SCENES_SCHEMA,
                                           temperature=0.4)
             if not subject["vi"]:
                 subject = {"vi": _clean(data.get("subject_vi")), "en": _clean(data.get("subject_en"))}
+            if not video_query["vi"]:
+                video_query = _video_query(data, subject)
             found = _parse_scenes(data, subject, title)
         except (ProviderResponseError, ProviderTimeout) as error:
             logger.warning("scene_part_failed part=%d reason=%s", number, error)
@@ -244,7 +296,14 @@ def split_scenes(provider: BaseAIProvider, title: str, topic: str, hook: str, bo
     if not subject["vi"]:
         subject = {"vi": title, "en": title}
     logger.info("scenes_split_by_part parts=%d expected=%d got=%d", len(parts), count, len(scenes))
-    return {"subject": subject, "scenes": scenes, "warnings": warnings}
+    return {"subject": subject, "scenes": fit_scene_count(scenes, count), "warnings": warnings,
+            "video_query": video_query if video_query["vi"] else _video_query({}, subject)}
+
+
+def _video_query(data: dict, subject: dict) -> dict:
+    """Keywords to search source videos (clip flow); the subject name is the fallback."""
+    return {"vi": _clean(data.get("video_query_vi")) or subject.get("vi", ""),
+            "en": _clean(data.get("video_query_en")) or subject.get("en", "")}
 
 
 class ScriptImportError(ValueError):
@@ -310,6 +369,10 @@ def parse_script_json(text: str) -> dict:
         if len(scenes) < 2:
             raise ScriptImportError("Cần ít nhất 2 cảnh, hoặc bỏ trường \"scenes\" để AI tự chia cảnh.")
     return {"script": script, "outline": outline, "scenes": scenes, "subject": subject}
+
+
+def paragraph_count(body: str) -> int:
+    return len(_paragraphs(body))
 
 
 def word_count(text: str) -> int:

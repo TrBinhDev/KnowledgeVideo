@@ -1,8 +1,9 @@
 """Reusable widgets for the card-based layout: section cards, the step bar, card pickers and the render progress panel."""
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QPixmap
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QHBoxLayout, QLabel, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout, QWidget,
+    QFrame, QGridLayout, QHBoxLayout, QLabel, QListWidget, QProgressBar, QPushButton, QSizePolicy, QVBoxLayout,
+    QWidget,
 )
 
 from ui import icons
@@ -26,6 +27,38 @@ def label(text: str = "", name: str = "", wrap: bool = False) -> QLabel:
         widget.setObjectName(name)
     widget.setWordWrap(wrap)
     return widget
+
+
+class FitList(QListWidget):
+    """A list as tall as all its rows, with no scroll bar of its own: the page around it scrolls instead."""
+
+    def __init__(self, minimum: int = 0, parent=None):
+        super().__init__(parent)
+        self._minimum = minimum
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        for signal in (self.model().rowsInserted, self.model().rowsRemoved, self.model().modelReset):
+            signal.connect(self._schedule_fit)
+        self.setFixedHeight(max(minimum, 40))
+
+    def _schedule_fit(self, *_args) -> None:
+        # After the rows are laid out: word-wrapped rows only know their height once the width is known.
+        QTimer.singleShot(0, self.fit)
+
+    def fit(self) -> None:
+        rows = sum(self.sizeHintForRow(row) for row in range(self.count()))
+        # Frame plus the stylesheet padding around the rows.
+        height = max(self._minimum, 40, rows + 2 * self.frameWidth() + 16)
+        if height != self.height():
+            self.setFixedHeight(height)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._schedule_fit()
+
+    def wheelEvent(self, event):
+        # Nothing to scroll here; let the page scroll.
+        event.ignore()
 
 
 class Card(QFrame):

@@ -10,6 +10,7 @@ import logging
 import math
 import os
 import re
+import shutil
 import subprocess
 import time
 from pathlib import Path
@@ -22,7 +23,7 @@ import yt_dlp
 from core.ai import BaseAIProvider
 from core.config import output_directory
 from core.network_security import fetch_safe_bytes
-from core.video_pipeline import check_cancelled, probe, run_media
+from core.video_pipeline import RenderCancelled, check_cancelled, probe, run_media
 
 logger = logging.getLogger("kv.clips")
 
@@ -72,7 +73,40 @@ class _QuietLogger:
         logger.warning("yt_dlp_error %s", message[:300])
 
 
+def _deno_path() -> str | None:
+    """Deno lets yt-dlp solve YouTube's JavaScript challenges; without it some links are refused now and then.
+    A winget install only reaches PATH in new terminals, so its usual location is checked too."""
+    found = shutil.which("deno")
+    if found:
+        return found
+    for candidate in (Path(os.environ.get("LOCALAPPDATA", "")) / "Microsoft" / "WinGet" / "Links" / "deno.exe",
+                      Path.home() / ".deno" / "bin" / "deno.exe"):
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
+def _real_ffmpeg_dir() -> str | None:
+    """Folder of the real ffmpeg when "ffmpeg" on PATH is a Chocolatey shim.
+
+    Section downloads through the shim failed now and then ("ffmpeg exited with code 3436169992", 1 in 5 tries),
+    the real binary did not (5 of 5).
+    """
+    found = shutil.which("ffmpeg") or ""
+    if "chocolatey" not in found.lower():
+        return None
+    lib = Path(found).resolve().parents[1] / "lib"
+    real = next(iter(sorted(lib.glob("ffmpeg*/tools/**/bin/ffmpeg.exe"))), None)
+    return str(real.parent) if real else None
+
+
 _YDL_BASE = {"quiet": True, "no_warnings": True, "noprogress": True, "socket_timeout": 30, "logger": _QuietLogger()}
+if _deno_path():
+    _YDL_BASE["js_runtimes"] = {"deno": {"path": _deno_path()}}
+if _real_ffmpeg_dir():
+    _YDL_BASE["ffmpeg_location"] = _real_ffmpeg_dir()
+# Downloads that fail are tried again with fresh links (YouTube sometimes refuses a link for a moment).
+_DOWNLOAD_PAUSES = (3, 8, None)
 
 
 def cache_directory() -> Path:
@@ -193,8 +227,20 @@ def _ollama_url() -> str:
     return (os.environ.get("KV_OLLAMA_URL") or "http://127.0.0.1:11434").rstrip("/").removesuffix("/api/chat")
 
 
-def vision_json(prompt: str, image_paths: list[Path], schema: dict) -> dict:
-    """Ask the local Ollama vision model about images; the answer is shaped by `schema`."""
+def gemini_vision(provider):
+    """Vision function backed by a Gemini provider (Google or a gateway) instead of the local Ollama model."""
+    def look(prompt: str, image_paths: list[Path], schema: dict) -> dict:
+        return provider.generate_json_images(prompt, image_paths, schema)
+
+    return look
+
+
+def ollama_vision(prompt: str, image_paths: list[Path], schema: dict) -> dict:
+    """Ask the local Ollama vision model about images; the answer is shaped by `schema`.
+
+    Every vision step takes a function with this signature (`vision`), so Gemini can look instead
+    (gemini_vision).
+    """
     payload = {
         "model": _vision_model(),
         "messages": [{"role": "user", "content": prompt,
@@ -266,13 +312,13 @@ def storyboard_sheet(info: dict, directory: Path) -> Path | None:
     return sheet
 
 
-def classify(sheet: Path) -> tuple[str, bool]:
-    data = vision_json(_CLASSIFY_PROMPT, [sheet], _CLASSIFY_SCHEMA)
+def classify(sheet: Path, vision=ollama_vision) -> tuple[str, bool]:
+    data = vision(_CLASSIFY_PROMPT, [sheet], _CLASSIFY_SCHEMA)
     kind = data.get("kind") if data.get("kind") in KIND_LABELS else "slides"
     return kind, bool(data.get("watermark"))
 
 
-def find_candidates(query: str, content_filter: str, progress=None, limit: int = 8) -> list[dict]:
+def find_candidates(query: str, content_filter: str, progress=None, limit: int = 8, vision=ollama_vision) -> list[dict]:
     """Creative Commons videos for the topic, each looked at through its storyboard and classified.
 
     Videos whose kind is allowed by `content_filter` come first. Logos do not exclude a video: they are cropped
@@ -286,15 +332,18 @@ def find_candidates(query: str, content_filter: str, progress=None, limit: int =
     boards = cache_directory() / "boards"
     candidates = []
     for number, item in enumerate(found, 1):
+        check_cancelled()
         if progress:
             progress(f"Xem thử video {number}/{len(found)}: {item['title'][:50]}", round(100 * (number - 1) / max(1, len(found))))
         try:
             info = video_info(item["id"])
             sheet = storyboard_sheet(info, boards)
-            kind, watermark = classify(sheet) if sheet else ("slides", False)
+            kind, watermark = classify(sheet, vision) if sheet else ("slides", False)
         except ClipError as error:
             logger.info("clip_candidate_skipped id=%s reason=%s", item["id"], error)
             continue
+        except RenderCancelled:
+            raise
         except (OSError, ValueError, RuntimeError) as error:
             logger.info("clip_candidate_skipped id=%s reason=%s", item["id"], type(error).__name__)
             continue
@@ -307,11 +356,19 @@ def find_candidates(query: str, content_filter: str, progress=None, limit: int =
 # ---------- preparing the chosen source: 360p copy, shots, logos ----------
 
 def _download(video_id: str, options: dict) -> None:
-    try:
-        with yt_dlp.YoutubeDL({**_YDL_BASE, **options}) as ydl:
-            ydl.download([watch_url(video_id)])
-    except yt_dlp.utils.DownloadError as error:
-        raise ClipError(f"Không tải được video {video_id} từ YouTube.") from error
+    for attempt, pause in enumerate(_DOWNLOAD_PAUSES, 1):
+        check_cancelled()
+        try:
+            # A new YoutubeDL per attempt fetches fresh stream links.
+            with yt_dlp.YoutubeDL({**_YDL_BASE, **options}) as ydl:
+                ydl.download([watch_url(video_id)])
+            return
+        except yt_dlp.utils.DownloadError as error:
+            logger.warning("youtube_download_failed id=%s attempt=%d reason=%s", video_id, attempt,
+                           re.sub(r"\x1b\[[0-9;]*m", "", str(error))[:300])
+            if pause is None:
+                raise ClipError(f"Không tải được video {video_id} từ YouTube (đã thử {attempt} lần).") from error
+            time.sleep(pause)
 
 
 def analysis_copy(video_id: str) -> Path:
@@ -448,17 +505,24 @@ def prepare_source(video_id: str, thumbs_directory: Path, progress=None) -> dict
     source = _source_fields(info)
     if not 10 <= source["duration"] <= MAX_SOURCE_SECONDS:
         raise ClipError("Video nguồn phải dài từ 10 giây đến 3 giờ.")
+    logger.info("clip_source id=%s duration=%.0fs channel=%s", video_id, source["duration"], source["channel"])
+    check_cancelled()
     report("Tải bản 360p để phân tích", 10)
+    started = time.monotonic()
     path = analysis_copy(video_id)
+    logger.info("clip_analysis_copy size=%.1fMB took=%.1fs", path.stat().st_size / 1e6, time.monotonic() - started)
+    check_cancelled()
     report("Tách shot", 45)
     shots = detect_shots(path, source["duration"])
     if not shots:
         raise ClipError("Không tách được shot nào đủ dài từ video này.")
+    logger.info("clip_shots count=%d (max %d)", len(shots), MAX_SHOTS)
     report(f"Tạo ảnh cho {len(shots)} shot", 60)
     shot_thumbnails(path, shots, thumbs_directory, video_id)
     report("Dò logo/watermark", 85)
     logos = detect_logos(path, source["duration"])
-    report("Xong", 100)
+    logger.info("clip_logos count=%d boxes=%s", len(logos), logos)
+    report(f"Xong: {len(shots)} shot, {len(logos)} vùng logo", 100)
     return {**source, "shots": shots, "logos": logos, "logos_from": "auto"}
 
 
@@ -496,11 +560,12 @@ def _contact_sheet(paths: list[Path], output: Path) -> None:
         raise ClipError("Không tạo được ảnh ghép khung hình.")
 
 
-def describe_shots(source: dict, thumbs_directory: Path, progress=None) -> None:
+def describe_shots(source: dict, thumbs_directory: Path, progress=None, vision=ollama_vision) -> None:
     """Short English description of each shot (fills shot["desc"]), nine shots per vision call."""
     shots = source["shots"]
     groups = [list(range(start, min(start + 9, len(shots)))) for start in range(0, len(shots), 9)]
     for number, group in enumerate(groups, 1):
+        check_cancelled()
         if progress:
             progress(f"AI xem shot {group[0] + 1}-{group[-1] + 1}/{len(shots)}", round(100 * (number - 1) / len(groups)))
         sheet = thumbs_directory / f"_grid_{number}.jpg"
@@ -510,7 +575,7 @@ def describe_shots(source: dict, thumbs_directory: Path, progress=None) -> None:
                   "(max 12 words) of what is visible: people, objects, place, action. Mention on-screen text "
                   "or title cards if any. Answer JSON only.")
         try:
-            data = vision_json(prompt, [sheet], _DESCRIBE_SCHEMA)
+            data = vision(prompt, [sheet], _DESCRIBE_SCHEMA)
         finally:
             sheet.unlink(missing_ok=True)
         for item in data.get("frames") or []:
@@ -541,16 +606,19 @@ def assign_shots(provider: BaseAIProvider, scenes: list[dict], shots: list[dict]
     lengths = scene_seconds(scenes, total_seconds)
     scene_lines = "\n".join(f"{index}. ({length:.0f}s) {scene['text'][:300]}"
                             for index, (scene, length) in enumerate(zip(scenes, lengths), 1))
-    shot_lines = "\n".join(f"{index}. ({shot['end'] - shot['start']:.1f}s) {shot.get('desc') or '(không rõ)'}"
+    shot_lines = "\n".join(f"{index}. [bắt đầu {shot['start']:.0f}s] {shot.get('desc') or '(không rõ)'}"
                            for index, shot in enumerate(shots, 1))
-    system = """Bạn là dựng phim cho video kiến thức dạng dọc. Ghép mỗi cảnh (lời đọc) với 1 shot trong video nguồn.
-- Chọn shot có hình ảnh khớp nhất với nội dung lời đọc của cảnh.
-- Mỗi shot chỉ dùng cho 1 cảnh. Ưu tiên giữ thứ tự thời gian của shot giống thứ tự cảnh khi có thể.
+    system = """Bạn là dựng phim cho video kiến thức dạng dọc. Mỗi cảnh (lời đọc) sẽ dùng 1 ĐOẠN LIỀN của video nguồn,
+bắt đầu từ shot bạn chọn và chạy tiếp đủ số giây của cảnh (qua các shot liền sau nó).
+- Chọn shot bắt đầu có hình ảnh khớp nhất với nội dung lời đọc của cảnh.
+- Mỗi shot chỉ làm điểm bắt đầu cho 1 cảnh; các đoạn không nên chồng lên nhau, nên chọn shot bắt đầu cách xa nhau
+  đủ số giây. Ưu tiên giữ thứ tự thời gian của shot giống thứ tự cảnh khi có thể.
 - Tránh shot chỉ có chữ, logo, màn hình tiêu đề hoặc người dẫn nói trước camera.
 - Nếu không có shot nào hợp với cảnh, trả "shot": 0.
 - Chỉ trả về JSON đúng schema, không giải thích.
 Schema: {"assignments": [{"scene": 1, "shot": 12}]}"""
-    user = f"Các cảnh (số giây cần):\n{scene_lines}\n\nCác shot có trong video nguồn (số giây, mô tả):\n{shot_lines}"
+    user = (f"Các cảnh (số giây cần):\n{scene_lines}\n\nCác shot có trong video nguồn (thời điểm bắt đầu, mô tả):\n"
+            f"{shot_lines}")
     data = provider.generate_json(system, user, _ASSIGN_SCHEMA, temperature=0.2)
     chosen: list[int | None] = [None] * len(scenes)
     said_none: set[int] = set()
@@ -567,6 +635,7 @@ Schema: {"assignments": [{"scene": 1, "shot": 12}]}"""
             chosen[scene - 1] = shot - 1
             used.add(shot - 1)
     warnings = []
+    ai_chose = len(used)
     # A small model sometimes answers "no fit" for most scenes; footage in story order is then better than pictures.
     if len(said_none) > len(scenes) // 2:
         warnings.append("AI không ghép được phần lớn cảnh; đã xếp shot theo thứ tự video — nên kiểm tra từng cảnh.")
@@ -584,7 +653,86 @@ Schema: {"assignments": [{"scene": 1, "shot": 12}]}"""
     missing = [str(index + 1) for index, shot in enumerate(chosen) if shot is None]
     if missing:
         warnings.append(f"Cảnh {', '.join(missing)}: không có shot hợp, sẽ dùng ảnh thay.")
+    logger.info("clip_assign ai_chose=%d filled_in_order=%d no_shot=%d | %s", ai_chose, len(used) - ai_chose,
+                len(missing), ", ".join(f"cảnh {index + 1}→shot {shot + 1}" if shot is not None else f"cảnh {index + 1}→ảnh"
+                                        for index, shot in enumerate(chosen)))
     return chosen, warnings
+
+
+# Each segment runs a little past its scene: the transition into the next scene overlaps it (0.6 s) and the
+# scene length is only estimated before the render measures the voice.
+SEGMENT_MARGIN = 1.0
+
+
+def segment_needs(scenes: list[dict], total_seconds: float) -> list[float]:
+    return [length + SEGMENT_MARGIN for length in scene_seconds(scenes, total_seconds)]
+
+
+def segment_from(source: dict, shot_index: int, need: float) -> dict:
+    """The continuous part of the source a scene uses: from the start of a shot, `need` seconds long
+    (shorter only at the very end of the video)."""
+    shot = source["shots"][shot_index]
+    start = shot["start"]
+    end = min(source["duration"] - 0.2, start + need)
+    return {"shot": shot_index, "thumb": shot["thumb"], "start": round(start, 3), "end": round(max(start + 0.5, end), 3)}
+
+
+def overlapping(clips: list[dict | None], index: int) -> list[int]:
+    """Other scenes whose segment overlaps scene `index`'s segment."""
+    clip = clips[index]
+    if not clip or "start" not in clip:
+        return []
+    return [other for other, item in enumerate(clips) if other != index and item and "start" in item
+            and clip["start"] < item["end"] and item["start"] < clip["end"]]
+
+
+def plan_segments(source: dict, chosen: list[int | None], needs: list[float]) -> tuple[list[dict | None], list[str]]:
+    """Turn the chosen start shots into non-overlapping continuous segments.
+
+    A segment that would overlap one already placed starts at the next shot that leaves room (searching forward,
+    then from the beginning); when the video is too short for it the scene uses a picture.
+    """
+    shots, placed, clips, moved, missing = source["shots"], [], [], [], []
+    for index, pick in enumerate(chosen):
+        if pick is None:
+            clips.append(None)
+            continue
+        found = None
+        for candidate in list(range(pick, len(shots))) + list(range(0, pick)):
+            segment = segment_from(source, candidate, needs[index])
+            # Too close to the end: the clip would have to be slowed down beyond MAX_SLOWDOWN.
+            if (segment["end"] - segment["start"]) * MAX_SLOWDOWN < needs[index] - SEGMENT_MARGIN:
+                continue
+            if any(segment["start"] < end and start < segment["end"] for start, end in placed):
+                continue
+            found = segment
+            break
+        if found is None:
+            missing.append(str(index + 1))
+            clips.append(None)
+            continue
+        if found["shot"] != pick:
+            moved.append(str(index + 1))
+        placed.append((found["start"], found["end"]))
+        clips.append(found)
+    warnings = []
+    if moved:
+        warnings.append(f"Cảnh {', '.join(moved)}: đoạn AI chọn trùng với cảnh khác, đã dời sang đoạn trống gần nhất.")
+    if missing:
+        warnings.append(f"Cảnh {', '.join(missing)}: video nguồn không còn đoạn trống đủ dài, sẽ dùng ảnh thay. "
+                        "Chọn video nguồn dài hơn hoặc giảm số cảnh.")
+    logger.info("clip_segments %s", ", ".join(
+        f"cảnh {index + 1}: {clip['start']:.1f}-{clip['end']:.1f}s" if clip else f"cảnh {index + 1}: ảnh"
+        for index, clip in enumerate(clips)))
+    return clips, warnings
+
+
+def assign_segments(provider: BaseAIProvider, scenes: list[dict], source: dict,
+                    total_seconds: float) -> tuple[list[dict | None], list[str]]:
+    """AI picks the start shot of each scene by meaning; the code lays out continuous segments."""
+    chosen, warnings = assign_shots(provider, scenes, source["shots"], total_seconds)
+    clips, more = plan_segments(source, chosen, segment_needs(scenes, total_seconds))
+    return clips, warnings + more
 
 
 # ---------- cutting the scene clips at render time ----------
@@ -641,8 +789,8 @@ def _clip_filter(window, blurs, target_w: int, target_h: int, slowdown: float) -
 
 
 def cut_scene_clip(source: dict, shot: dict, needed: float, target_w: int, target_h: int, output: Path) -> dict:
-    """Fetch one shot in high quality (only that time range) and make the scene clip: 9:16, logos avoided or
-    blurred, no sound, slowed down a little when the shot is shorter than the scene."""
+    """Fetch one time range {"start", "end"} in high quality (only that range) and make the scene clip: 9:16, logos
+    avoided or blurred, no sound, slowed down a little when the range is shorter than the scene."""
     directory = output.parent
     stem = output.stem + "_src"
     for stale in directory.glob(stem + ".*"):
@@ -677,22 +825,24 @@ def prepare_render_clips(state: dict, assets: Path, resolution: str, total_secon
     source = state["clip_source"]
     target_w, target_h = map(int, resolution.split("x"))
     scenes = state["scenes"]
-    lengths = scene_seconds(scenes, total_seconds)
+    needs = segment_needs(scenes, total_seconds)
     todo = [index for index, scene in enumerate(scenes) if scene.get("clip")]
     for number, index in enumerate(todo, 1):
         progress("prepare_clips", round(2 + 8 * (number - 1) / max(1, len(todo))))
         clip = scenes[index]["clip"]
+        # Scenes matched before segments existed hold only a shot: they use that shot's own range.
         shot = source["shots"][clip["shot"]]
+        span = {"start": clip.get("start", shot["start"]), "end": clip.get("end", shot["end"])}
         output = assets / f"scene_{index:02d}_clip_{target_h}.mp4"
-        cut_key = [source["id"], shot["start"], shot["end"], source.get("logos") or []]
-        # Reused when the same shot was already cut the same way (e.g. re-rendering with another template).
+        cut_key = [source["id"], span["start"], span["end"], source.get("logos") or []]
+        # Reused when the same range was already cut the same way (e.g. re-rendering with another template).
         if clip.get("file") == output.name and clip.get("cut_key") == cut_key and output.is_file():
             continue
         clip.pop("file", None)
         started = time.monotonic()
-        result = cut_scene_clip(source, shot, lengths[index] + 0.8, target_w, target_h, output)
+        result = cut_scene_clip(source, span, needs[index], target_w, target_h, output)
         clip.update({**result, "cut_key": cut_key})
-        logger.info("scene_clip index=%d shot=%d took=%.1fs blurred=%d", index, clip["shot"],
+        logger.info("scene_clip index=%d range=%.1f-%.1fs took=%.1fs blurred=%d", index, span["start"], span["end"],
                     time.monotonic() - started, result["blurred"])
 
 

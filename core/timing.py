@@ -8,8 +8,14 @@ logger = logging.getLogger("kv.timing")
 
 # Edge TTS still sounds natural within roughly ±10% speed; beyond that the script itself must change.
 MAX_RATE_PERCENT = 10
+# Allowed final difference from the target: 5% of the length, at least 3 s (60 s: ±3 s, 300 s: ±15 s).
+TOLERANCE_SHARE = 0.05
 TOLERANCE_SECONDS = 3.0
 _ATTEMPTS = 3
+
+
+def tolerance(target_seconds: float) -> float:
+    return max(TOLERANCE_SECONDS, TOLERANCE_SHARE * target_seconds)
 
 
 def narration(script: dict) -> str:
@@ -42,7 +48,12 @@ def rate_for(measured_seconds: float, target_seconds: float, measured_rate_perce
 
 
 def fit_rate(text: str, voice: str, target_seconds: float, progress=None, measured_seconds: float | None = None) -> dict:
-    """Pick the speaking rate that lands the audio within TOLERANCE_SECONDS of the target, verified by re-measuring."""
+    """Pick the speaking rate that brings the audio to the target.
+
+    The length at that rate is computed (duration scales about 1/(1+rate)) instead of synthesizing again: each
+    measurement reads the whole script aloud, which took minutes for long videos. The render measures the real
+    audio anyway.
+    """
     def report(message: str) -> None:
         if progress:
             progress(message, -1)
@@ -52,22 +63,16 @@ def fit_rate(text: str, voice: str, target_seconds: float, progress=None, measur
         report(f"Đo giọng đọc: {base:.1f}s / mục tiêu {target_seconds:.0f}s")
     else:
         base = measured_seconds
-    percent, seconds = 0, base
-    for _ in range(2):
-        if abs(seconds - target_seconds) <= TOLERANCE_SECONDS:
-            break
-        wanted = rate_for(seconds, target_seconds, percent)
-        if wanted == percent:
-            break
-        percent = wanted
-        seconds = measure(text, voice, percent)
-        report(f"Chỉnh tốc độ đọc {rate_text(percent)}: {seconds:.1f}s")
+    percent = 0 if abs(base - target_seconds) <= tolerance(target_seconds) else rate_for(base, target_seconds)
+    seconds = base / (1 + percent / 100)
+    if percent:
+        report(f"Chỉnh tốc độ đọc {rate_text(percent)}: ~{seconds:.1f}s")
     return {
         "voice": voice,
         "tts_rate": rate_text(percent),
         "base_seconds": round(base, 1),
         "seconds": round(seconds, 1),
         "target_seconds": target_seconds,
-        "within_tolerance": abs(seconds - target_seconds) <= TOLERANCE_SECONDS,
+        "within_tolerance": abs(seconds - target_seconds) <= tolerance(target_seconds),
         "narration": text,
     }

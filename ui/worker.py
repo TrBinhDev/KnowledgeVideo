@@ -8,6 +8,14 @@ from core.video_pipeline import RenderCancelled
 logger = logging.getLogger("kv.ui.worker")
 
 
+def scaled_progress(progress, start: int, end: int):
+    """Progress callback for one part of a longer job: the part's 0–100 % maps onto start–end % of the job."""
+    def report(text: str, percent: int) -> None:
+        progress(text, -1 if percent < 0 else round(start + (end - start) * min(100, percent) / 100))
+
+    return report
+
+
 class TaskThread(QThread):
     """Runs one blocking job off the GUI thread. `job` receives a progress(stage, percent) callback."""
 

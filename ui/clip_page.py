@@ -2,7 +2,7 @@
 import html
 from pathlib import Path
 
-from PySide6.QtCore import QPoint, QRect, QSize, Qt
+from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer
 from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QHBoxLayout, QLabel, QLineEdit, QListView, QListWidget, QListWidgetItem, QMessageBox,
@@ -11,9 +11,13 @@ from PySide6.QtWidgets import (
 
 from core import clips, images
 from ui import icons
-from ui.widgets import Card, label
+from ui.widgets import Card, FitList, label
+from ui.worker import scaled_progress
 
 PREVIEW_W, PREVIEW_H = 270, 480
+# AI for step 4 (looking at frames, choosing segments); "same" follows the AI chosen in step 1.
+VISION_CHOICES = {"same": "Như AI viết nội dung", "gemini": "Gemini", "gateway": "Gemini qua cổng API",
+                  "ollama": "Ollama (gemma3 trên máy)"}
 
 
 def _button(text: str, name: str = "", icon: str | None = None, color: str = "#334155") -> QPushButton:
@@ -108,17 +112,35 @@ class ClipPage(QWidget):
                                      "Cho phép hoạt hình: vẫn bỏ slide và slideshow ảnh tĩnh.")
         search = _button("Tìm video", "soft", "search", "#1d4ed8")
         search.clicked.connect(self._search)
+        # The AI suggests the search keywords in Vietnamese and English; one click switches between them.
+        self.query_buttons = {}
         search_row = QHBoxLayout()
         search_row.addWidget(self.query_edit, 1)
+        for language, text in (("vi", "VI"), ("en", "EN")):
+            button = _button(text, "link")
+            button.setToolTip("Dùng từ khóa AI gợi ý bằng " + ("tiếng Việt" if language == "vi" else "tiếng Anh"))
+            button.clicked.connect(lambda _checked=False, key=language: self._use_suggested_query(key))
+            self.query_buttons[language] = button
+            search_row.addWidget(button)
         search_row.addWidget(self.filter_combo)
         search_row.addWidget(search)
         source.body.addLayout(search_row)
+        # Same choice as in step 1 (MainWindow.set_vision_choice keeps both boxes in step).
+        self.vision_combo = QComboBox()
+        for key, name in VISION_CHOICES.items():
+            self.vision_combo.addItem(name, key)
+        self.vision_combo.currentIndexChanged.connect(
+            lambda _index: self.window.set_vision_choice(self.vision_combo.currentData()))
+        vision_row = QHBoxLayout()
+        vision_row.addWidget(label("AI xem hình & chọn đoạn", "fieldLabel"))
+        vision_row.addWidget(self.vision_combo)
+        vision_row.addWidget(label("dùng cho Tìm video, Dùng link/video đã chọn và Ghép lại tự động.", "hint"), 1)
+        source.body.addLayout(vision_row)
         source.body.addWidget(label("Tìm khoảng 8 video, AI xem thử từng video (mỗi video ~20 giây). Video có logo "
                                     "vẫn dùng được: logo được crop ra ngoài khung dọc hoặc làm mờ.", "hint", wrap=True))
-        self.candidate_list = QListWidget()
+        self.candidate_list = FitList(minimum=60)
         self.candidate_list.setIconSize(QSize(120, 135))
         self.candidate_list.setWordWrap(True)
-        self.candidate_list.setMinimumHeight(200)
         self.candidate_list.itemDoubleClicked.connect(lambda _item: self._use_selected())
         source.body.addWidget(self.candidate_list)
         use = QPushButton("Dùng video đã chọn")
@@ -147,16 +169,18 @@ class ClipPage(QWidget):
         self.logo_widgets = [mark, no_logo]
         source.body.addLayout(logo_row)
 
-        scenes = Card("Cảnh & clip", "AI ghép mỗi cảnh với 1 shot của video nguồn. Khung xem trước là phần 9:16 sẽ "
-                      "dùng; ô đỏ là logo sẽ được làm mờ.", "image")
+        scenes = Card("Cảnh & clip", "Mỗi cảnh là 1 đoạn liền của video nguồn: AI chọn điểm bắt đầu hợp với lời đọc, "
+                      "đoạn chạy đủ số giây của cảnh. Khung xem trước là phần 9:16 sẽ dùng; ô đỏ là logo sẽ được làm mờ.",
+                      "image")
         body = QHBoxLayout()
         body.setSpacing(16)
-        self.scene_list = QListWidget()
+        # Every scene is shown (no scrolling inside the list); the detail panel moves down next to the selected
+        # scene so it stays in view on long videos.
+        self.scene_list = FitList(minimum=PREVIEW_H + 60)
         self.scene_list.setIconSize(QSize(72, 128))
         self.scene_list.setWordWrap(True)
-        self.scene_list.setMinimumHeight(520)
         self.scene_list.currentRowChanged.connect(self._show_detail)
-        body.addWidget(self.scene_list, 1)
+        body.addWidget(self.scene_list, 1, Qt.AlignTop)
         detail = QVBoxLayout()
         self.preview = QLabel("Chưa có clip")
         self.preview.setObjectName("preview")
@@ -175,10 +199,20 @@ class ClipPage(QWidget):
         detail.addLayout(_row(pick, picture))
         detail.addStretch(1)
         # Fixed width, as on the picture step: long text must not squeeze the scene list.
-        panel = QWidget()
-        panel.setFixedWidth(320)
-        panel.setLayout(detail)
-        body.addWidget(panel)
+        self.detail_panel = QWidget()
+        self.detail_panel.setLayout(detail)
+        self.detail_offset = QWidget()
+        self.detail_offset.setFixedHeight(0)
+        column = QVBoxLayout()
+        column.setContentsMargins(0, 0, 0, 0)
+        column.setSpacing(0)
+        column.addWidget(self.detail_offset)
+        column.addWidget(self.detail_panel)
+        column.addStretch(1)
+        column_widget = QWidget()
+        column_widget.setFixedWidth(320)
+        column_widget.setLayout(column)
+        body.addWidget(column_widget)
         scenes.body.addLayout(body)
         resplit = _button("Chia cảnh lại", icon="refresh")
         resplit.clicked.connect(self.window._split_scenes)
@@ -222,11 +256,17 @@ class ClipPage(QWidget):
     def load(self) -> None:
         """Show the saved state of this run (after opening it or after the scenes were split)."""
         subject = self.state.get("image_subject") or {}
-        self.query_edit.setText(self.state.get("clip_query") or subject.get("vi") or self.state.get("topic", ""))
+        suggested = self.state.get("video_query") or {}
+        self.query_edit.setText(self.state.get("clip_query") or suggested.get("vi") or subject.get("vi")
+                                or self.state.get("topic", ""))
+        for language, button in self.query_buttons.items():
+            button.setEnabled(bool(suggested.get(language)))
+            button.setToolTip(suggested.get(language) or "Chưa có từ khóa gợi ý")
         self.filter_combo.setCurrentIndex(max(0, self.filter_combo.findData(self.state.get("clip_filter"))))
         self._fill_candidates()
         self._show_source()
         self.refresh_scenes()
+        self.window.set_vision_choice(self.state.get("vision_ai", "same"))
 
     def scenes_ready(self) -> None:
         """New scenes from the AI split or a JSON import: match them to the source video if one is chosen."""
@@ -260,8 +300,15 @@ class ClipPage(QWidget):
                                         "Không tìm được video Creative Commons dùng được. Thử từ khóa ngắn hơn, "
                                         "tiếng Anh, hoặc dán link video bạn có quyền dùng.")
 
-        self.window._run("Tìm video nguồn Creative Commons...",
-                         lambda progress: clips.find_candidates(query, content_filter, progress), done)
+        self.window._run("Tìm video nguồn...",
+                         self.window._step4_job(lambda provider, vision: clips.find_candidates(
+                             query, content_filter, provider.notify, vision=vision)),
+                         done, cancellable=True)
+
+    def _use_suggested_query(self, language: str) -> None:
+        text = (self.state.get("video_query") or {}).get(language)
+        if text:
+            self.query_edit.setText(text)
 
     def _fill_candidates(self) -> None:
         self.candidate_list.clear()
@@ -302,11 +349,12 @@ class ClipPage(QWidget):
             return
         scenes, total, thumbs = self.state["scenes"], clips.estimated_total(self.state), self._shots_dir()
 
-        def call(provider):
-            source = clips.prepare_source(video_id, thumbs, provider.notify)
-            clips.describe_shots(source, thumbs, provider.notify)
-            provider.notify("AI ghép shot với cảnh", -1)
-            chosen, warnings = clips.assign_shots(provider, scenes, source["shots"], total)
+        def call(provider, vision):
+            progress = provider.notify
+            source = clips.prepare_source(video_id, thumbs, scaled_progress(progress, 0, 30))
+            clips.describe_shots(source, thumbs, scaled_progress(progress, 30, 88), vision)
+            progress("AI chọn đoạn cho từng cảnh", 90)
+            chosen, warnings = clips.assign_segments(provider, scenes, source, total)
             return source, chosen, warnings
 
         def done(result) -> None:
@@ -316,7 +364,8 @@ class ClipPage(QWidget):
             self._show_source()
             self._fill_pictures(warnings)
 
-        self.window._run("Chuẩn bị video nguồn (tải 360p, tách shot, AI xem)...", self.window._ai_job(call), done)
+        self.window._run("Chuẩn bị video nguồn (tải 360p, tách shot, AI xem)...", self.window._step4_job(call), done,
+                         cancellable=True)
 
     def _show_source(self) -> None:
         source = self._source()
@@ -383,12 +432,15 @@ class ClipPage(QWidget):
 
     # ---------- scenes ----------
 
-    def _apply(self, chosen: list[int | None]) -> None:
-        shots = self._source()["shots"]
-        for scene, shot in zip(self.state["scenes"], chosen):
-            scene["clip"] = {"shot": shot, "thumb": shots[shot]["thumb"]} if shot is not None else None
+    def _apply(self, chosen: list[dict | None]) -> None:
+        """Scene clips from assign_segments: a continuous source segment each, or None (picture)."""
+        for scene, clip in zip(self.state["scenes"], chosen):
+            scene["clip"] = clip
         self.window._save()
         self.refresh_scenes(self.scene_list.currentRow())
+
+    def _clips(self) -> list[dict | None]:
+        return [scene.get("clip") for scene in self.state.get("scenes") or []]
 
     def reassign(self) -> None:
         source = self._source()
@@ -402,9 +454,10 @@ class ClipPage(QWidget):
             self._apply(chosen)
             self._fill_pictures(warnings)
 
-        self.window._run("AI ghép shot với cảnh...",
-                         self.window._ai_job(lambda provider: clips.assign_shots(provider, scenes, source["shots"], total)),
-                         done)
+        self.window._run("AI chọn đoạn cho từng cảnh...",
+                         self.window._step4_job(lambda provider, _vision: clips.assign_segments(provider, scenes, source,
+                                                                                               total)),
+                         done, cancellable=True)
 
     def _fill_pictures(self, notes: list[str]) -> None:
         """Scenes left without a shot get a picture, searched the same way as in the picture flow."""
@@ -468,7 +521,9 @@ class ClipPage(QWidget):
         source = self._source()
         for index, scene in enumerate(self.state.get("scenes") or []):
             clip = scene.get("clip")
-            if clip and source:
+            if clip and source and "start" in clip:
+                tag = f"Đoạn {_clock(clip['start'])}–{_clock(clip['end'])}"
+            elif clip and source:
                 tag = f"Shot {clip['shot'] + 1}"
             elif scene.get("image"):
                 tag = "Ảnh thay"
@@ -500,33 +555,58 @@ class ClipPage(QWidget):
         else:
             self.preview.setPixmap(pixmap.scaled(self.preview.size(), Qt.KeepAspectRatio, Qt.SmoothTransformation))
         if clip and source:
-            shot = source["shots"][clip["shot"]]
-            length = shot["end"] - shot["start"]
+            shots = source["shots"]
+            start, end = clip.get("start", shots[clip["shot"]]["start"]), clip.get("end", shots[clip["shot"]]["end"])
+            length = end - start
             need = clips.scene_seconds(scenes, clips.estimated_total(self.state))[row]
             note = ""
             if need > length * clips.MAX_SLOWDOWN:
-                note = "\nShot ngắn hơn cảnh nhiều: sẽ phát chậm rồi lặp lại — nên chọn shot dài hơn."
+                note = "\nĐoạn ngắn hơn cảnh nhiều: sẽ phát chậm rồi lặp lại — nên chọn điểm bắt đầu khác."
             elif need > length:
-                note = "\nShot hơi ngắn: sẽ phát chậm lại một chút."
-            self.shot_info.setText(f"Shot {clip['shot'] + 1}/{len(source['shots'])} · {_clock(shot['start'])}–"
-                                   f"{_clock(shot['end'])} ({length:.1f}s; cảnh cần ~{need:.0f}s)\n"
-                                   f"{shot.get('desc') or ''}{note}")
+                note = "\nĐoạn hơi ngắn: sẽ phát chậm lại một chút."
+            others = clips.overlapping(self._clips(), row)
+            if others:
+                note += f"\nTrùng một phần với đoạn của cảnh {', '.join(str(other + 1) for other in others)}."
+            # What the segment shows: the descriptions of the shots it runs through.
+            inside = [shot.get("desc") or "?" for shot in shots if shot["start"] < end and start < shot["end"]]
+            self.shot_info.setText(f"Đoạn liền {_clock(start)} → {_clock(end)} ({length:.0f}s; cảnh cần ~{need:.0f}s), "
+                                   f"bắt đầu từ shot {clip['shot'] + 1}/{len(shots)}\n"
+                                   + "\n".join(f"· {desc}" for desc in inside[:5]) + note)
         elif scene.get("image"):
             self.shot_info.setText(f"Dùng ảnh: {scene['image'].get('credit', '')}")
         else:
             self.shot_info.setText("")
+        QTimer.singleShot(0, self._follow_selection)
+
+    def _follow_selection(self) -> None:
+        """Move the detail panel level with the selected scene, without running past the end of the list."""
+        item = self.scene_list.currentItem()
+        if not item:
+            return
+        top = self.scene_list.visualItemRect(item).top()
+        room = max(0, self.scene_list.height() - self.detail_panel.sizeHint().height())
+        self.detail_offset.setFixedHeight(max(0, min(top, room)))
 
     def _pick_shot(self) -> None:
         row, source = self.scene_list.currentRow(), self._source()
         if row < 0 or not source:
             return
         scenes = self.state["scenes"]
-        owner = {scene["clip"]["shot"]: index for index, scene in enumerate(scenes) if scene.get("clip")}
+        need = clips.segment_needs(scenes, clips.estimated_total(self.state))[row]
+        # Scenes whose segment covers each shot's start, to show which parts are already used.
+        owner = {}
+        for index, scene in enumerate(scenes):
+            clip = scene.get("clip")
+            for number, shot in enumerate(source["shots"]):
+                if clip and clip.get("start", -1) <= shot["start"] < clip.get("end", -1):
+                    owner.setdefault(number, index)
         dialog = QDialog(self)
-        dialog.setWindowTitle(f"Chọn shot cho cảnh {row + 1}")
+        dialog.setWindowTitle(f"Chọn điểm bắt đầu cho cảnh {row + 1}")
         dialog.resize(900, 640)
         layout = QVBoxLayout(dialog)
         layout.addWidget(label(scenes[row]["text"], "hint", wrap=True))
+        layout.addWidget(label(f"Cảnh chạy liền ~{need:.0f} giây từ shot bạn chọn. \"· cảnh N\" là phần đang thuộc "
+                               "đoạn của cảnh khác.", "hint", wrap=True))
         grid = QListWidget()
         grid.setViewMode(QListView.IconMode)
         grid.setIconSize(QSize(192, 108))
@@ -544,8 +624,7 @@ class ClipPage(QWidget):
         if current is not None:
             grid.setCurrentRow(current)
         layout.addWidget(grid, 1)
-        layout.addWidget(label("Shot đang dùng ở cảnh khác sẽ được đổi chỗ với cảnh này.", "hint"))
-        cancel, choose = _button("Hủy"), QPushButton("Chọn shot")
+        cancel, choose = _button("Hủy"), QPushButton("Bắt đầu từ shot này")
         choose.setObjectName("primary")
         cancel.clicked.connect(dialog.reject)
         choose.clicked.connect(dialog.accept)
@@ -553,14 +632,14 @@ class ClipPage(QWidget):
         layout.addLayout(_row(cancel, choose))
         if dialog.exec() != QDialog.Accepted or grid.currentRow() < 0:
             return
-        picked = grid.currentRow()
-        other = owner.get(picked)
-        if other is not None and other != row:
-            previous = scenes[row].get("clip")
-            scenes[other]["clip"] = {"shot": previous["shot"], "thumb": previous["thumb"]} if previous else None
-        scenes[row]["clip"] = {"shot": picked, "thumb": source["shots"][picked]["thumb"]}
+        scenes[row]["clip"] = clips.segment_from(source, grid.currentRow(), need)
         self.window._save()
         self.refresh_scenes(row)
+        others = clips.overlapping(self._clips(), row)
+        if others:
+            QMessageBox.information(self, "Đoạn bị trùng",
+                                    f"Đoạn mới trùng một phần với cảnh {', '.join(str(o + 1) for o in others)}: "
+                                    "hai cảnh sẽ lặp lại cùng hình. Có thể chọn điểm bắt đầu khác.")
 
     def _use_picture(self) -> None:
         row = self.scene_list.currentRow()
