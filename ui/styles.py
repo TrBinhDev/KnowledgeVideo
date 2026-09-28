@@ -80,6 +80,16 @@ QPushButton#soft:hover { background: #e0eaff; }
 QPushButton:disabled { color: #94a3b8; background: #f1f5f9; border-color: #e2e8f0; }
 QCheckBox { spacing: 8px; }
 
+/* flow banner at the top of step 1: blue for the picture flow, amber for the clip flow */
+QFrame#flowBanner { background: #eff6ff; border: 1px solid #bfdbfe; border-radius: 12px; }
+QFrame#flowBanner[kind="clip"] { background: #fff7ed; border-color: #fdba74; }
+QLabel#flowIcon { background: #2563eb; border-radius: 18px; }
+QLabel#flowIcon[kind="clip"] { background: #ea580c; }
+QLabel#flowTitle { font-weight: 700; font-size: 10.5pt; color: #1d4ed8; }
+QLabel#flowTitle[kind="clip"] { color: #c2410c; }
+QLabel#flowText { color: #475569; font-size: 8.5pt; }
+QFrame#clipLinkBox { background: #fff7ed; border: 1px dashed #fdba74; border-radius: 10px; }
+
 /* call to action bars */
 QFrame#ctaBar { background: #f5f8ff; border: 1px solid #d6e2ff; border-radius: 12px; }
 QFrame#doneBar { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 12px; }

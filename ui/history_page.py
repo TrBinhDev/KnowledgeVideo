@@ -8,6 +8,7 @@ from PySide6.QtWidgets import QFrame, QHBoxLayout, QLabel, QPushButton, QVBoxLay
 
 from core import catalog
 from core.config import list_runs, output_directory
+from core.preview import scene_picture
 from ui import icons
 from ui.widgets import Card, label
 
@@ -36,8 +37,8 @@ def _cover(directory: Path, state: dict) -> Path | None:
     if thumbnail.is_file():
         return thumbnail
     for scene in state.get("scenes") or []:
-        path = directory / "assets" / (scene.get("image") or {}).get("file", "")
-        if scene.get("image") and path.is_file():
+        path = scene_picture(directory, scene)
+        if path and path.is_file():
             return path
     return None
 
@@ -71,7 +72,8 @@ class _RunRow(QFrame):
         seconds = (script.get("timing") or {}).get("seconds")
         length = f"{seconds:.0f} giây" if seconds else f"mục tiêu {state.get('duration', '?')} giây"
         template = catalog.TEMPLATES_BY_TYPE.get(state.get("content_type"), {}).get((state.get("render") or {}).get("template"), "")
-        meta = " · ".join(part for part in (_created(directory), length, f"{len(state.get('scenes') or [])} cảnh",
+        kind = "Video clip" if state.get("kind") == "clip" else "Video ảnh"
+        meta = " · ".join(part for part in (kind, _created(directory), length, f"{len(state.get('scenes') or [])} cảnh",
                                             template.partition(" (")[0]) if part)
         texts = QVBoxLayout()
         texts.setSpacing(4)

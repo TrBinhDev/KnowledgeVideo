@@ -19,6 +19,20 @@
 
 Mọi bước AI đều có duyệt/sửa: **AI có thể viết sai năm tháng, tên người, sự kiện — luôn kiểm tra kịch bản trước khi render.**
 
+## Luồng video clip ("Tạo video clip")
+
+Bước 1–3 giống luồng ảnh. Bước 4 **Cảnh & clip** dùng các shot của **một video nguồn** cho cả video (màu và chất hình đồng đều):
+
+- Bước 1 của luồng clip có dải màu cam nhận diện và ô **Link video nguồn (tùy chọn)**: có link thì bước 4 dùng luôn video đó.
+- **Chọn video nguồn**: tìm video YouTube **Creative Commons** (được phép dùng lại, phải ghi nguồn) theo từ khóa chủ đề, hoặc **dán link YouTube** video bạn có quyền dùng.
+  - Khi tìm, app lấy storyboard (ảnh lưới nhỏ, không tải video) và dùng model xem ảnh của Ollama (`gemma3`) phân loại: quay thật, tư liệu cũ, hoạt hình/3D, tranh vẽ, slide, người dẫn. Bộ lọc *Chỉ tư liệu thật* hoặc *Cho phép hoạt hình*.
+- App tải bản **360p** của video nguồn để phân tích: tách shot (FFmpeg), AI mô tả từng shot, AI ghép shot với từng cảnh (mỗi shot dùng 1 lần); cảnh không có shot hợp thì dùng ảnh thay. Từng cảnh có thể **chọn shot khác** hoặc **dùng ảnh thay**.
+- **Logo/watermark**: tự dò vùng chữ/logo đứng yên suốt video; khung dọc 9:16 được đặt tránh logo, logo còn trong khung thì làm mờ. Có thể **khoanh vùng logo** bằng tay hoặc chọn *Không có logo*.
+- Khi render: chỉ tải **đúng đoạn** của các shot đã chọn ở chất lượng cao (tối đa 1080p), cắt 9:16, bỏ tiếng gốc (chỉ có giọng đọc theo kịch bản), shot ngắn hơn cảnh được phát chậm lại tối đa 1,6 lần. Render xong thì xóa bản 360p.
+- **Ghi nguồn**: tên video nguồn, kênh, link, giấy phép được ghi lên video và vào `render/credits.txt`; nút **Copy ghi nguồn** để dán vào caption khi đăng.
+
+Bản 360p nằm trong `output/_clip_cache/` (giới hạn dung lượng chỉnh trong Cài đặt, tự xóa file cũ nhất; có nút dọn cache).
+
 ## Nguồn ảnh (tự động, theo thứ tự)
 
 1. Wikimedia Commons theo từ khóa của cảnh (tiếng Việt, rồi tiếng Anh)
@@ -71,6 +85,8 @@ Mở `.env` và điền các giá trị cần dùng (không commit file này):
 | `KV_OUTPUT_DIR` | Thư mục lưu kết quả (mặc định `./output`) |
 | `KV_HTTP_USER_AGENT` | User-Agent khi gọi Wikimedia (nên thêm thông tin liên hệ của bạn) |
 | `KV_VIDEO_FONT` | Font TTF hỗ trợ tiếng Việt cho chữ trên video (mặc định Arial) |
+| `KV_VISION_MODEL` | Model Ollama xem ảnh cho luồng video clip (mặc định `gemma3`) |
+| `KV_CLIP_CACHE_MB` | Giới hạn cache video nguồn 360p (MB, mặc định 2048) |
 
 ## Chạy
 
@@ -78,10 +94,11 @@ Mở `.env` và điền các giá trị cần dùng (không commit file này):
 .\.venv\Scripts\python.exe main.py
 ```
 
-Sidebar có 4 mục:
+Sidebar có 5 mục:
 
-- **Tạo video** – 5 bước ở trên; nút "Video mới" để bắt đầu lại. Khi render có nút **Hủy**; xong thì **Xuất video** (MP4 kèm phụ đề `.srt` và ảnh bìa `.jpg` cùng tên ra thư mục bạn chọn).
-- **Lịch sử video** – các video đã làm, mở lại để sửa ảnh, đổi mẫu hoặc render lại.
+- **Tạo video ảnh** – 5 bước ở trên; nút "Video mới" để bắt đầu lại. Khi render có nút **Hủy**; xong thì **Xuất video** (MP4 kèm phụ đề `.srt`, ảnh bìa `.jpg` và ghi nguồn `.credits.txt` nếu có, cùng tên, ra thư mục bạn chọn).
+- **Tạo video clip** – luồng video clip ở trên.
+- **Lịch sử video** – các video đã làm (nhãn Video ảnh / Video clip), mở lại để sửa cảnh, đổi mẫu hoặc render lại.
 - **Mẫu video** – xem trước từng template với chuyển cảnh và chuyển động Ken Burns (dùng ảnh của video gần nhất, chưa có thì dùng ảnh minh họa tự vẽ); "Dùng mẫu này" áp dụng cho video đang làm.
 - **Cài đặt** – sửa các giá trị trong `.env` ngay trong app, có hiệu lực không cần mở lại.
 
@@ -115,6 +132,8 @@ core/render.py       Chuẩn bị dữ liệu render
 core/preview.py      Ảnh mẫu template và clip xem trước chuyển cảnh (dùng chung bộ lọc với render)
 core/samples.py      Ảnh minh họa tự vẽ cho trang Mẫu video khi chưa có video nào
 core/sources.py      Đọc tài liệu txt/docx/pdf, tách nội dung nguyên văn thành tiêu đề/hook/thân bài
+core/clips.py        Luồng video clip: tìm video CC, phân loại, tách shot, dò logo, ghép shot, cắt clip 9:16
+ui/clip_page.py      Bước "Cảnh & clip"
 assets/templates/    Khung SVG cho template tin tức
 ```
 
@@ -124,3 +143,4 @@ assets/templates/    Khung SVG cho template tin tức
 - Tìm ảnh tự động vẫn có cảnh ra ảnh lệch nội dung, nhất là chủ đề trừu tượng; nên xem lại từng cảnh.
 - "Theo câu đọc" ước lượng điểm đổi ảnh theo độ dài chữ của từng cảnh trên mốc thời gian từng câu; ranh giới cảnh nằm giữa câu có thể lệch vài trăm mili giây.
 - PDF dạng ảnh scan không đọc được (cần OCR).
+- Video clip: `gemma3` phân loại video và nhận ra logo chưa chắc chắn (thử 8 tấm storyboard: đúng 6); mô tả shot có thể đọc sai chữ trên hình. Video Creative Commons về lịch sử Việt Nam phần lớn là slide/tranh vẽ/3D, ít cảnh quay thật. Một số kênh gắn nhãn CC cho video không phải của họ — app không kiểm tra được.

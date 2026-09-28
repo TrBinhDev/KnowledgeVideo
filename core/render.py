@@ -25,8 +25,8 @@ def _content_label(state: dict) -> str:
 
 
 def _source_label(scenes: list[dict]) -> str:
-    sources = {(scene.get("image") or {}).get("source") for scene in scenes}
-    labels = []
+    sources = {(scene.get("image") or {}).get("source") for scene in scenes if not scene.get("clip")}
+    labels = ["video YouTube"] if any(scene.get("clip") for scene in scenes) else []
     if sources & {"wikipedia", "wikipedia_topic"}:
         labels.append("Wikipedia")
     if "wikimedia" in sources:
@@ -51,12 +51,23 @@ def import_music(store: RunStore, source: str) -> str:
     return target.name
 
 
+def _scene_asset(scene: dict) -> str:
+    """The scene's cut clip (clip flow) or its picture."""
+    clip = scene.get("clip") or {}
+    return clip.get("file") or (scene.get("image") or {}).get("file", "")
+
+
 def build_snapshot(state: dict, render_options: dict, music_file: str, tts_rate: str = "+0%") -> dict:
     scenes = state["scenes"]
-    missing = [index + 1 for index, scene in enumerate(scenes) if not scene.get("image")]
+    missing = [index + 1 for index, scene in enumerate(scenes) if not _scene_asset(scene)]
     if missing:
-        raise RuntimeError(f"Các cảnh chưa có ảnh: {', '.join(map(str, missing))}.")
+        raise RuntimeError(f"Các cảnh chưa có ảnh hoặc clip: {', '.join(map(str, missing))}.")
     script = state["script"]
+    source_name = _source_label(scenes)
+    clip_source = state.get("clip_source") or {}
+    if clip_source.get("channel") and any(scene.get("clip") for scene in scenes):
+        # On-screen credit for the source video (CC BY needs the author named).
+        source_name = source_name.replace("video YouTube", f"{clip_source['channel']} (YouTube)")
     return {
         "script": {"title": script["title"], "hook": script["hook"], "body": script["body"], "revision": 1},
         "voice": render_options["voice"],
@@ -67,11 +78,11 @@ def build_snapshot(state: dict, render_options: dict, music_file: str, tts_rate:
         "scene_timing": render_options.get("scene_timing", "even"),
         "subtitle_style": render_options.get("subtitle_style", "normal"),
         "video_mode": "news_report",
-        "asset_files": [scene["image"]["file"] for scene in scenes],
+        "asset_files": [_scene_asset(scene) for scene in scenes],
         "scene_texts": [scene["text"] for scene in scenes],
         "music_file": music_file,
         "music_volume": render_options["music_volume"],
-        "source_name": _source_label(scenes),
+        "source_name": source_name,
         "title_badge": _year_badge(script["title"], state.get("topic", "")),
         "title_label": _content_label(state),
         "template_options": {"show_source": True, "show_title_card": True, "title_position": "top"},
@@ -94,10 +105,11 @@ def make_thumbnail(video: Path) -> Path:
 
 
 def export_video(video: Path, target: Path) -> list[Path]:
-    """Copy the MP4 with its subtitles and cover image next to it, all named after the chosen file."""
+    """Copy the MP4 with its subtitles, cover image and source credits next to it, all named after the chosen file."""
     target = target.with_suffix(".mp4")
     copies = [(video, target), (video.with_name("subtitles.srt"), target.with_suffix(".srt")),
-              (video.with_name("thumbnail.jpg"), target.with_suffix(".jpg"))]
+              (video.with_name("thumbnail.jpg"), target.with_suffix(".jpg")),
+              (video.with_name("credits.txt"), target.with_suffix(".credits.txt"))]
     written = []
     for source, destination in copies:
         if source.is_file():

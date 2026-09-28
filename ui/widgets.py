@@ -47,7 +47,8 @@ class Card(QFrame):
             header.addWidget(badge, 0, Qt.AlignTop)
         titles = QVBoxLayout()
         titles.setSpacing(2)
-        titles.addWidget(label(title, "cardTitle"))
+        self.title = label(title, "cardTitle")
+        titles.addWidget(self.title)
         if subtitle:
             self.subtitle = label(subtitle, "cardSubtitle", wrap=True)
             titles.addWidget(self.subtitle)
@@ -76,8 +77,9 @@ class _StepItem(QFrame):
         texts = QVBoxLayout()
         texts.setSpacing(0)
         self.title = label(title, "stepTitle")
+        self.subtitle = label(subtitle, "stepSubtitle")
         texts.addWidget(self.title)
-        texts.addWidget(label(subtitle, "stepSubtitle"))
+        texts.addWidget(self.subtitle)
         row.addWidget(self.circle)
         row.addLayout(texts)
 
@@ -119,6 +121,10 @@ class Stepper(QWidget):
     def set_state(self, current: int, reached: int) -> None:
         for index, item in enumerate(self._items):
             item.set_state("current" if index == current else "done" if index <= reached else "todo")
+
+    def set_title(self, index: int, title: str, subtitle: str) -> None:
+        self._items[index].title.setText(title)
+        self._items[index].subtitle.setText(subtitle)
 
 
 class _Choice(QFrame):
@@ -266,7 +272,7 @@ class ChoiceCards(QWidget):
 
 # Pipeline stages grouped into the four steps shown while rendering.
 RENDER_GROUPS = (
-    ("Chuẩn bị kịch bản & ảnh", ("prepare_content", "prepare_assets")),
+    ("Chuẩn bị kịch bản & ảnh", ("prepare_clips", "prepare_content", "prepare_assets")),
     ("Giọng đọc & phụ đề", ("generate_tts", "generate_subtitle")),
     ("Dựng hình & hiệu ứng", ("build_timeline", "template_composition", "ffmpeg_render")),
     ("Kiểm tra & hoàn tất", ("validate",)),

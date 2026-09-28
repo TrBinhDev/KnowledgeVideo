@@ -37,9 +37,17 @@ def _repeat(images: list[Path], count: int) -> list[Path]:
     return [images[index % len(images)] for index in range(count)]
 
 
+def scene_picture(directory: Path, scene: dict) -> Path | None:
+    """Still picture of a scene: the frame of its shot (clip flow) or its image."""
+    clip, image = scene.get("clip"), scene.get("image")
+    if clip and clip.get("thumb"):
+        return directory / "assets" / "clip_shots" / clip["thumb"]
+    return directory / "assets" / image["file"] if image else None
+
+
 def _run_images(directory: Path, state: dict) -> list[Path]:
-    paths = [directory / "assets" / scene["image"]["file"] for scene in state.get("scenes") or [] if scene.get("image")]
-    return [path for path in paths if path.is_file()]
+    paths = [scene_picture(directory, scene) for scene in state.get("scenes") or []]
+    return [path for path in paths if path and path.is_file()]
 
 
 def run_source(store: RunStore, state: dict, count: int = SCENES) -> PreviewSource:

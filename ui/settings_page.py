@@ -1,4 +1,4 @@
-"""Settings stored in .env: AI access, output folder, Wikimedia User-Agent and video font."""
+"""Settings stored in .env: AI access, output folder, clip cache, Wikimedia User-Agent and video font."""
 import os
 from pathlib import Path
 
@@ -7,6 +7,7 @@ from PySide6.QtWidgets import (
     QFileDialog, QGridLayout, QHBoxLayout, QLineEdit, QMessageBox, QPushButton, QVBoxLayout, QWidget,
 )
 
+from core import clips
 from core.config import output_directory, update_env
 from ui import icons
 from ui.widgets import Card, label
@@ -19,9 +20,13 @@ AI_FIELDS = (
     ("KV_OLLAMA_URL", "Ollama URL", "Mặc định http://127.0.0.1:11434"),
     ("KV_OLLAMA_MODEL", "Ollama model mặc định", "Ví dụ gemma3"),
     ("KV_OLLAMA_TIMEOUT_SECONDS", "Ollama timeout (giây)", "Model chạy trên máy có thể chậm; mặc định 240."),
+    ("KV_VISION_MODEL", "Ollama model xem ảnh (video clip)",
+     "Xem khung hình video nguồn: loại nội dung, mô tả shot. Cần model có thị giác; mặc định gemma3."),
 )
 OTHER_FIELDS = (
     ("KV_OUTPUT_DIR", "Thư mục lưu video", "Để trống: thư mục output trong project."),
+    ("KV_CLIP_CACHE_MB", "Giới hạn cache video nguồn (MB)",
+     "Bản 360p tải về để phân tích; vượt giới hạn thì tự xóa file cũ nhất. Mặc định 2048."),
     ("KV_HTTP_USER_AGENT", "User-Agent khi gọi Wikimedia", "Nên thêm thông tin liên hệ của bạn theo chính sách Wikimedia."),
     ("KV_VIDEO_FONT", "Font chữ trên video (.ttf)", "Để trống: Arial. Cần font có đủ dấu tiếng Việt."),
 )
@@ -49,7 +54,10 @@ class SettingsPage(QWidget):
         save.clicked.connect(self._save)
         reload = QPushButton("Hoàn tác")
         reload.clicked.connect(self.load)
+        self.clear_cache = QPushButton("Dọn cache video")
+        self.clear_cache.clicked.connect(self._clear_cache)
         buttons = QHBoxLayout()
+        buttons.addWidget(self.clear_cache)
         buttons.addStretch(1)
         buttons.addWidget(reload)
         buttons.addWidget(save)
@@ -98,6 +106,15 @@ class SettingsPage(QWidget):
         for key, edit in self.fields.items():
             edit.setText(os.environ.get(key, ""))
         self.show_key.setChecked(False)
+        self.clear_cache.setText(f"Dọn cache video ({clips.cache_size() / 1024 / 1024:,.0f} MB)")
+
+    def _clear_cache(self) -> None:
+        answer = QMessageBox.question(self, "Dọn cache video",
+                                      "Xóa các bản 360p và ảnh xem thử đã tải? Video đã render không bị ảnh hưởng; "
+                                      "video đang làm dở sẽ tự tải lại khi cần.")
+        if answer == QMessageBox.Yes:
+            clips.clear_cache()
+            self.load()
 
     def _values(self) -> dict[str, str] | None:
         values = {key: edit.text().strip() for key, edit in self.fields.items()}
@@ -107,6 +124,9 @@ class SettingsPage(QWidget):
         timeout = values["KV_OLLAMA_TIMEOUT_SECONDS"]
         if timeout and not (timeout.replace(".", "", 1).isdigit() and float(timeout) > 0):
             problems.append("Ollama timeout phải là số giây lớn hơn 0.")
+        cache = values["KV_CLIP_CACHE_MB"]
+        if cache and not (cache.isdigit() and int(cache) >= 200):
+            problems.append("Giới hạn cache video phải là số MB, tối thiểu 200.")
         font = values["KV_VIDEO_FONT"]
         if font and (not Path(font).is_file() or Path(font).suffix.lower() not in (".ttf", ".otf")):
             problems.append("Font phải là file .ttf hoặc .otf có trên máy.")

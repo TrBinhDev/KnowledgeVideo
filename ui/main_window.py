@@ -7,7 +7,7 @@ from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import QSize, QStandardPaths, Qt, QTimer, QUrl
-from PySide6.QtGui import QDesktopServices, QIcon, QPixmap
+from PySide6.QtGui import QDesktopServices, QGuiApplication, QIcon, QPixmap
 from PySide6.QtMultimedia import QMediaPlayer
 from PySide6.QtMultimediaWidgets import QVideoWidget
 from PySide6.QtWidgets import (
@@ -16,17 +16,18 @@ from PySide6.QtWidgets import (
     QSpinBox, QStackedWidget, QVBoxLayout, QWidget,
 )
 
-from core import catalog, images, sources, steps, timing, video_pipeline
+from core import catalog, clips, images, sources, steps, timing, video_pipeline
 from core.ai import build_provider, default_model, list_models
 from core.config import RunStore, output_directory, slug
 from core.preview import SCENES, render_preview, render_thumbnail, run_source
 from core.render import _source_label, build_snapshot, export_video, import_music, make_thumbnail, render_video
 from core.video_pipeline import transition_names
 from ui import icons
+from ui.clip_page import ClipPage
 from ui.history_page import HistoryPage
 from ui.settings_page import SettingsPage
 from ui.templates_page import TemplatesPage
-from ui.widgets import Card, ChoiceCards, RenderProgress, Stepper, label
+from ui.widgets import Card, ChoiceCards, RenderProgress, Stepper, label, repolish
 from ui.worker import TaskThread
 
 STEPS = (
@@ -37,14 +38,38 @@ STEPS = (
     ("Mẫu & Render", "Template & xuất video"),
 )
 TOPIC, SCRIPT, SCENES_PAGE, RENDER = 1, 2, 3, 4
-CREATE, HISTORY, GALLERY, SETTINGS = 0, 1, 2, 3
+# CLIP_CREATE is a sidebar entry only: it shows the CREATE section in the clip flow.
+CREATE, HISTORY, GALLERY, SETTINGS, CLIP_CREATE = 0, 1, 2, 3, 4
+SCENE_STEPS = {"image": ("Cảnh & ảnh", "Ảnh cho từng cảnh"), "clip": ("Cảnh & clip", "Shot cho từng cảnh")}
+# Step 1 texts that tell the two flows apart: banner icon/title/text, input card title/subtitle, keyword example/hint.
+FLOW_TEXTS = {
+    "image": {
+        "icon": "image", "title": "Video ảnh",
+        "text": "Mỗi cảnh là 1 ảnh tư liệu (Commons, Wikipedia...) có chuyển động Ken Burns. Hợp với mọi chủ đề, "
+                "kể cả chủ đề ít phim tư liệu.",
+        "card": ("Nhập nội dung / Từ khóa", "Nhập từ khóa để AI gợi ý chủ đề, hoặc đưa nội dung có sẵn (bài viết, "
+                 "tài liệu) để làm video bám theo đúng tài liệu đó."),
+        "example": "Ví dụ: trận Bạch Đằng, nhà Trần chống quân Nguyên",
+        "hint": "Gợi ý: tên trận đánh, triều đại, nhân vật, sự kiện hoặc mốc năm cụ thể.",
+    },
+    "clip": {
+        "icon": "film", "title": "Video clip",
+        "text": "Mỗi cảnh là 1 shot cắt từ 1 video YouTube (video Creative Commons tìm theo chủ đề, hoặc link bạn "
+                "dán), crop 9:16, che logo, thay tiếng gốc bằng giọng đọc kịch bản.",
+        "card": ("Nội dung & video nguồn", "Kịch bản viết như luồng ảnh; video nguồn dán link ngay dưới đây, hoặc để "
+                 "app tìm ở bước Cảnh & clip."),
+        "example": "Ví dụ: chiến dịch Điện Biên Phủ 1954, Vịnh Hạ Long",
+        "hint": "Nên chọn chủ đề có nhiều cảnh quay thật: trận đánh có phim tư liệu, địa danh, lễ hội, thiên nhiên. "
+                "Chủ đề quá xưa (trước thế kỷ 20) thường chỉ có tranh vẽ, 3D.",
+    },
+}
 SOURCE_LABELS = {
     "wikipedia": "Wikipedia", "wikipedia_topic": "Wikipedia - ảnh chung chủ đề, nên kiểm tra",
     "wikimedia": "Commons", "openverse": "Openverse",
     "pollinations": "AI Pollinations", "ai": "AI Gemini", "placeholder": "ảnh thay thế",
 }
 STAGE_LABELS = {
-    "prepare_content": "Chuẩn bị nội dung", "prepare_assets": "Chuẩn bị ảnh", "generate_tts": "Tạo giọng đọc",
+    "prepare_clips": "Tải và cắt clip cho từng cảnh", "prepare_content": "Chuẩn bị nội dung", "prepare_assets": "Chuẩn bị ảnh", "generate_tts": "Tạo giọng đọc",
     "generate_subtitle": "Tạo phụ đề", "build_timeline": "Dựng timeline", "template_composition": "Ghép template",
     "ffmpeg_render": "Render FFmpeg", "validate": "Kiểm tra video",
 }
@@ -129,6 +154,8 @@ class MainWindow(QMainWindow):
         self.resize(1320, 860)
         self.state: dict = {}
         self.store: RunStore | None = None
+        # "image": scenes are pictures; "clip": scenes are shots of one source video.
+        self.kind = "image"
         self.task: TaskThread | None = None
         self.busy = False
         self.reached = 0
@@ -170,11 +197,13 @@ class MainWindow(QMainWindow):
         self.settings_page.saved.connect(self._on_settings_saved)
         self.sections = QStackedWidget()
         self.section_headers = (
-            ("Tạo video", "Tạo video kiến thức lịch sử từ chủ đề với AI: đề cương, kịch bản, ảnh tư liệu, "
+            ("Tạo video ảnh", "Tạo video kiến thức lịch sử từ chủ đề với AI: đề cương, kịch bản, ảnh tư liệu, "
                           "giọng đọc và render MP4.", new_video),
             ("Lịch sử video", "Mở lại video đã làm để sửa tiếp hoặc render lại.", None),
             ("Mẫu video", "Xem trước các mẫu giao diện, chuyển cảnh và chuyển động.", None),
             ("Cài đặt", "API key, model AI, thư mục lưu video và font chữ.", None),
+            ("Tạo video clip", "Tạo video kiến thức từ 1 video nguồn: AI viết kịch bản, ghép shot hợp với từng cảnh, "
+                               "crop 9:16 và che logo.", new_video),
         )
         for widget in (create, _scroll(self.history_page), _scroll(self.templates_page), _scroll(self.settings_page)):
             self.sections.addWidget(widget)
@@ -209,6 +238,7 @@ class MainWindow(QMainWindow):
         container.setObjectName("app")
         container.setLayout(root)
         self.setCentralWidget(container)
+        self._apply_kind("image")
         self._show_section(CREATE)
         self._go(0)
 
@@ -233,7 +263,7 @@ class MainWindow(QMainWindow):
         layout.addLayout(brand)
         layout.addSpacing(14)
         groups = (
-            ("SẢN XUẤT", (("Tạo video", "film", CREATE),)),
+            ("SẢN XUẤT", (("Tạo video ảnh", "image", CREATE), ("Tạo video clip", "film", CLIP_CREATE))),
             ("QUẢN LÝ", (("Lịch sử video", "clock", HISTORY), ("Mẫu video", "layout", GALLERY))),
             ("HỆ THỐNG", (("Cài đặt", "sliders", SETTINGS),)),
         )
@@ -322,18 +352,28 @@ class MainWindow(QMainWindow):
         self.reached = index
         self._go(index)
 
+    def _create_section(self) -> int:
+        return CLIP_CREATE if self.kind == "clip" else CREATE
+
     def _show_section(self, section: int) -> None:
+        if section in (CREATE, CLIP_CREATE):
+            kind = "clip" if section == CLIP_CREATE else "image"
+            if kind != self.kind and not self._switch_kind(kind):
+                self.nav.button(self._create_section() if self.sections.currentIndex() == CREATE
+                                else self.sections.currentIndex()).setChecked(True)
+                return
         title, subtitle, _action = self.section_headers[section]
         self.page_title.setText(title)
         self.page_subtitle.setText(subtitle)
-        self.new_video_button.setVisible(section == CREATE)
+        self.new_video_button.setVisible(section in (CREATE, CLIP_CREATE))
         self.nav.button(section).setChecked(True)
-        if self.sections.currentIndex() == GALLERY and section != GALLERY:
+        page = CREATE if section == CLIP_CREATE else section
+        if self.sections.currentIndex() == GALLERY and page != GALLERY:
             self.templates_page.deactivate()
-        if section != CREATE:
+        if page != CREATE:
             self.preview_player.pause()
-        self.sections.setCurrentIndex(section)
-        if section == CREATE:
+        self.sections.setCurrentIndex(page)
+        if page == CREATE:
             self._on_page_changed(self.pages.currentIndex())
         elif section == HISTORY:
             self.history_page.refresh()
@@ -341,6 +381,35 @@ class MainWindow(QMainWindow):
             self.templates_page.activate()
         elif section == SETTINGS:
             self.settings_page.load()
+
+    def _switch_kind(self, kind: str) -> bool:
+        """Start a fresh video in the other flow; the current one stays in the history."""
+        if self.busy:
+            QMessageBox.information(self, "Đang bận", "Hãy đợi việc đang chạy xong rồi chuyển loại video.")
+            return False
+        self.state, self.store = {}, None
+        self._reset_views()
+        self._apply_kind(kind)
+        self.reached = 0
+        self._go(0)
+        return True
+
+    def _apply_kind(self, kind: str) -> None:
+        self.kind = kind
+        self.stepper.set_title(SCENES_PAGE, *SCENE_STEPS[kind])
+        self.scenes_stack.setCurrentIndex(1 if kind == "clip" else 0)
+        texts = FLOW_TEXTS[kind]
+        for widget in (self.flow_banner, self.flow_icon, self.flow_title):
+            widget.setProperty("kind", kind)
+        repolish(self.flow_banner)
+        self.flow_icon.setPixmap(icons.pixmap(texts["icon"], "#ffffff", 18, 2))
+        self.flow_title.setText(f"Đang tạo: {texts['title']}")
+        self.flow_text.setText(texts["text"])
+        self.source_card.title.setText(texts["card"][0])
+        self.source_card.subtitle.setText(texts["card"][1])
+        self.input_edit.setPlaceholderText(texts["example"])
+        self.keyword_hint.setText(texts["hint"])
+        self.clip_link_box.setVisible(kind == "clip")
 
     def _on_settings_saved(self) -> None:
         self._update_storage()
@@ -350,7 +419,7 @@ class MainWindow(QMainWindow):
         """Gallery choice: applied to the render step now and whenever its templates are refilled."""
         self.preferred_look = (template, transition)
         self._apply_look()
-        self._show_section(CREATE)
+        self._show_section(self._create_section())
         self.status.setText(f"Đã chọn mẫu {self.template_cards.currentText()} · {self.transition_combo.currentText()} "
                             "cho video này.")
 
@@ -367,6 +436,7 @@ class MainWindow(QMainWindow):
         self.preview_player.stop()
         self.input_edit.clear()
         self.source_edit.clear()
+        self.clip_link_edit.clear()
         self.topic_cards.clear()
         self.topic_edit.clear()
         self.outline_title.clear()
@@ -386,6 +456,7 @@ class MainWindow(QMainWindow):
         self.music_edit.clear()
         self.render_panel.setVisible(False)
         self.done_bar.setVisible(False)
+        self.clip_page.reset()
 
     def _new_video(self) -> None:
         if self.busy:
@@ -393,7 +464,7 @@ class MainWindow(QMainWindow):
         self.state, self.store = {}, None
         self._reset_views()
         self.reached = 0
-        self._show_section(CREATE)
+        self._show_section(self._create_section())
         self._go(0)
 
     def _open_run(self, path: str) -> None:
@@ -407,6 +478,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Không mở được", f"Không đọc được state.json ({type(error).__name__}).")
             return
         self._reset_views()
+        self._apply_kind(state.get("kind", "image"))
         self.store, self.state = RunStore(directory), state
         self._restore_inputs(state)
         if state.get("topics"):
@@ -426,11 +498,14 @@ class MainWindow(QMainWindow):
             reached = SCRIPT
         scenes = state.get("scenes") or []
         if scenes:
-            self._refresh_scene_list()
+            if self.kind == "clip":
+                self.clip_page.load()
+            else:
+                self._refresh_scene_list()
             reached = SCENES_PAGE
-        self._show_section(CREATE)
+        self._show_section(self._create_section())
         self.reached = reached
-        if scenes and all(scene.get("image") for scene in scenes):
+        if scenes and all(scene.get("clip") or scene.get("image") for scene in scenes):
             self._to_render()
         else:
             self._go(reached)
@@ -458,7 +533,8 @@ class MainWindow(QMainWindow):
         else:
             self.input_edit.setPlainText(state.get("input", ""))
         self.input_tabs.button(1 if from_source else 0).setChecked(True)
-        self.input_stack.setCurrentIndex(1 if from_source else 0)
+        self._show_input_tab(1 if from_source else 0)
+        self.clip_link_edit.setText(state.get("clip_link", ""))
 
     # ---------- progress and background work ----------
 
@@ -585,6 +661,25 @@ class MainWindow(QMainWindow):
 
     # ---------- step 1: content ----------
 
+    def _build_flow_banner(self) -> QFrame:
+        self.flow_banner = QFrame()
+        self.flow_banner.setObjectName("flowBanner")
+        row = QHBoxLayout(self.flow_banner)
+        row.setContentsMargins(16, 12, 16, 12)
+        row.setSpacing(14)
+        self.flow_icon = label("", "flowIcon")
+        self.flow_icon.setFixedSize(36, 36)
+        self.flow_icon.setAlignment(Qt.AlignCenter)
+        texts = QVBoxLayout()
+        texts.setSpacing(2)
+        self.flow_title = label("", "flowTitle")
+        self.flow_text = label("", "flowText", wrap=True)
+        texts.addWidget(self.flow_title)
+        texts.addWidget(self.flow_text)
+        row.addWidget(self.flow_icon)
+        row.addLayout(texts, 1)
+        return self.flow_banner
+
     def _build_start(self) -> QWidget:
         kind = Card("Chọn loại nội dung", "Chọn dạng nội dung bạn muốn tạo video", "layout")
         self.type_cards = ChoiceCards(columns=4, tile=True, art_size=QSize(0, 84))
@@ -652,13 +747,16 @@ class MainWindow(QMainWindow):
 
         source = Card("Nhập nội dung / Từ khóa", "Nhập từ khóa để AI gợi ý chủ đề, hoặc đưa nội dung có sẵn "
                       "(bài viết, tài liệu) để làm video bám theo đúng tài liệu đó.", "search")
+        self.source_card = source
         import_json = _button("Nhập kịch bản JSON", "soft", "file", "#1d4ed8")
         import_json.clicked.connect(self._import_script_json)
         source.actions.addWidget(import_json)
         tabs = QHBoxLayout()
         tabs.setSpacing(4)
         self.input_tabs = QButtonGroup(self)
-        self.input_stack = QStackedWidget()
+        # Plain list of tab pages, not a QStackedWidget: a stack is as tall as its tallest page, which left a big
+        # gap under the short keyword tab. Hidden pages take no room.
+        self.input_pages: list[QWidget] = []
         for index, text in enumerate(("Nhập từ khóa gợi ý từ AI", "Nhập nội dung trực tiếp")):
             tab = _button(text, "tab")
             tab.setCheckable(True)
@@ -666,7 +764,7 @@ class MainWindow(QMainWindow):
             self.input_tabs.addButton(tab, index)
             tabs.addWidget(tab)
         tabs.addStretch(1)
-        self.input_tabs.idClicked.connect(self.input_stack.setCurrentIndex)
+        self.input_tabs.idClicked.connect(self._show_input_tab)
         source.body.addLayout(tabs)
 
         keywords = QWidget()
@@ -676,7 +774,8 @@ class MainWindow(QMainWindow):
         self.input_edit.setFixedHeight(84)
         self.input_edit.setPlaceholderText("Ví dụ: trận Bạch Đằng, nhà Trần chống quân Nguyên")
         keywords_layout.addWidget(self.input_edit)
-        keywords_layout.addWidget(_hint("Gợi ý: tên trận đánh, triều đại, nhân vật, sự kiện hoặc mốc năm cụ thể."))
+        self.keyword_hint = _hint("")
+        keywords_layout.addWidget(self.keyword_hint)
         suggest = _primary("AI gợi ý chủ đề", "sparkles")
         direct = _button("Dùng làm chủ đề luôn")
         suggest.clicked.connect(self._suggest_topics)
@@ -710,10 +809,30 @@ class MainWindow(QMainWindow):
         from_source = _primary("Tiếp tục với nội dung này →")
         from_source.clicked.connect(self._use_source)
         content_layout.addLayout(_buttons(from_source))
-        self.input_stack.addWidget(keywords)
-        self.input_stack.addWidget(content)
-        source.body.addWidget(self.input_stack)
-        return _scroll(kind, ai, source)
+        self.input_pages = [keywords, content]
+        for page in self.input_pages:
+            source.body.addWidget(page)
+        self._show_input_tab(0)
+
+        # Clip flow only: the source video can be given right away; step 4 then uses it without searching.
+        self.clip_link_box = QFrame()
+        self.clip_link_box.setObjectName("clipLinkBox")
+        link_layout = QVBoxLayout(self.clip_link_box)
+        link_layout.setContentsMargins(14, 10, 14, 12)
+        link_layout.setSpacing(6)
+        link_layout.addWidget(_field("Link video nguồn (tùy chọn)"))
+        self.clip_link_edit = QLineEdit()
+        self.clip_link_edit.setPlaceholderText("https://www.youtube.com/watch?v=...  — video của bạn hoặc video bạn có quyền dùng")
+        link_layout.addWidget(self.clip_link_edit)
+        link_layout.addWidget(_hint("Có link: đến bước Cảnh & clip app dùng luôn video này. Để trống: ở bước đó app "
+                                    "tìm video Creative Commons theo chủ đề."))
+        # Above the tabs: it must be filled before pressing the tab's start button.
+        source.body.insertWidget(0, self.clip_link_box)
+        return _scroll(self._build_flow_banner(), kind, ai, source)
+
+    def _show_input_tab(self, index: int) -> None:
+        for position, page in enumerate(self.input_pages):
+            page.setVisible(position == index)
 
     def _duration(self) -> int | None:
         """Length typed or picked in the duration box ("75", "75 giây"), None (with a message) when out of range."""
@@ -737,7 +856,16 @@ class MainWindow(QMainWindow):
         duration = self._duration()
         if duration is None:
             return False
+        link = self.clip_link_edit.text().strip() if self.kind == "clip" else ""
+        if link:
+            try:
+                clips.youtube_id(link)
+            except clips.ClipError as error:
+                QMessageBox.information(self, "Link video nguồn chưa đúng", str(error))
+                return False
+        self.state["clip_link"] = link
         self.state.update({
+            "kind": self.kind,
             "content_type": self.type_cards.currentData(), "category": self.category_cards.currentData(),
             "duration": duration, "voice": self.script_voice_combo.currentData(),
             "style": self.style_combo.currentData(), "points": self.points_combo.currentData(),
@@ -1293,7 +1421,12 @@ class MainWindow(QMainWindow):
         fetch.clicked.connect(self._fetch_missing_images)
         next_button.clicked.connect(self._to_render)
         card.body.addLayout(_buttons(resplit, fetch, next_button))
-        return _scroll(card)
+        # Step 4 differs per flow: pictures (this card) or shots of a source video (ClipPage).
+        self.clip_page = ClipPage(self)
+        self.scenes_stack = QStackedWidget()
+        self.scenes_stack.addWidget(_scroll(card))
+        self.scenes_stack.addWidget(_scroll(self.clip_page))
+        return self.scenes_stack
 
     def _show_scenes(self, result: dict) -> None:
         self.state["image_subject"] = result["subject"]
@@ -1301,8 +1434,14 @@ class MainWindow(QMainWindow):
         # Shown together with the image search messages, which follow right away.
         self.scene_warnings = list(result.get("warnings") or [])
         self._save()
-        self._refresh_scene_list()
         self._reset_from(SCENES_PAGE)
+        if self.kind == "clip":
+            if self.scene_warnings:
+                QMessageBox.warning(self, "Cần kiểm tra một số cảnh", "\n".join(self.scene_warnings))
+                self.scene_warnings = []
+            self.clip_page.scenes_ready()
+            return
+        self._refresh_scene_list()
         self._fetch_missing_images()
 
     def _refresh_scene_list(self, select: int = 0) -> None:
@@ -1462,9 +1601,11 @@ class MainWindow(QMainWindow):
         self._run("Gemini đang tạo ảnh...", lambda _p: images.from_ai(scene["image_prompt"], store.assets, row), done)
 
     def _to_render(self) -> None:
-        missing = [str(index + 1) for index, scene in enumerate(self.state.get("scenes") or []) if not scene.get("image")]
+        missing = [str(index + 1) for index, scene in enumerate(self.state.get("scenes") or [])
+                   if not scene.get("clip") and not scene.get("image")]
         if missing:
-            QMessageBox.information(self, "Còn cảnh thiếu ảnh", f"Các cảnh chưa có ảnh: {', '.join(missing)}.")
+            what = "clip hoặc ảnh" if self.kind == "clip" else "ảnh"
+            QMessageBox.information(self, f"Còn cảnh thiếu {what}", f"Các cảnh chưa có {what}: {', '.join(missing)}.")
             return
         self._fill_templates(self.state.get("content_type", "kien_thuc"))
         self._restore_render_options()
@@ -1502,7 +1643,18 @@ class MainWindow(QMainWindow):
         else:
             self.done_cover.setPixmap(icons.pixmap("box-checked", "#16a34a", 26))
         self.result_label.setText(str(video))
+        self.copy_credits.setVisible(video.with_name("credits.txt").is_file())
         self.done_bar.setVisible(True)
+
+    def _copy_credits(self) -> None:
+        video = Path(self.state.get("video") or "")
+        try:
+            text = video.with_name("credits.txt").read_text(encoding="utf-8").strip()
+        except OSError:
+            QMessageBox.information(self, "Chưa có ghi nguồn", "Video này không có file ghi nguồn.")
+            return
+        QGuiApplication.clipboard().setText(text)
+        self.status.setText("Đã copy phần ghi nguồn, dán vào caption khi đăng video.")
 
     # ---------- step 5: template and render ----------
 
@@ -1655,6 +1807,10 @@ class MainWindow(QMainWindow):
         texts.addWidget(self.result_label)
         texts.addStretch(1)
         self.open_folder = _button("Mở thư mục", icon="folder")
+        self.copy_credits = _button("Copy ghi nguồn", icon="file")
+        self.copy_credits.setToolTip("Tên video nguồn, kênh, link và giấy phép, để dán vào caption khi đăng.")
+        self.copy_credits.clicked.connect(self._copy_credits)
+        self.copy_credits.setVisible(False)
         self.export_button = _button("Xuất video", "soft", "folder", "#1d4ed8")
         self.open_video = _primary("Xem video", "play")
         self.open_video.clicked.connect(lambda: self._open(self.state.get("video")))
@@ -1663,6 +1819,7 @@ class MainWindow(QMainWindow):
         done_layout.addWidget(self.done_cover)
         done_layout.addLayout(texts, 1)
         done_layout.addWidget(self.open_folder)
+        done_layout.addWidget(self.copy_credits)
         done_layout.addWidget(self.export_button)
         done_layout.addWidget(self.open_video)
         self.done_bar.setVisible(False)
@@ -1821,9 +1978,16 @@ class MainWindow(QMainWindow):
                 if fitted.get("voice") != options["voice"] or fitted.get("narration") != timing.narration(script):
                     fitted = timing.fit_rate(timing.narration(script), options["voice"], state["duration"], step)
                     script["timing"] = fitted
+                clip_flow = state.get("kind") == "clip" and state.get("clip_source")
+                if clip_flow:
+                    clips.prepare_render_clips(state, store.assets, options["resolution"], fitted["seconds"], step)
                 snapshot = build_snapshot(state, options, import_music(store, options["music_source"]),
                                           fitted["tts_rate"])
-                return str(render_video(store, snapshot, step))
+                video = render_video(store, snapshot, step)
+                if clip_flow:
+                    clips.write_credits(state, video.parent)
+                    clips.release_source(state["clip_source"])
+                return str(video)
             finally:
                 video_pipeline.clear_cancel(worker["id"])
 
