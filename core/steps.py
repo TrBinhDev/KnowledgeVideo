@@ -3,13 +3,18 @@ import logging
 import re
 
 from core import catalog, prompts, timing
-from core.ai import BaseAIProvider, ProviderResponseError
+from core.ai import BaseAIProvider, ProviderResponseError, ProviderTimeout
 
 logger = logging.getLogger("kv.steps")
 
 
+# Control tokens small local models sometimes leak into their answers (gemma3 wrote "<start_of_image>" into a
+# script, which the voice then read aloud).
+_MODEL_TOKENS = re.compile(r"</?(?:start_of_[a-z_]+|end_of_[a-z_]+|image|img|bos|eos|pad|unk|mask|s)>", re.IGNORECASE)
+
+
 def _clean(value) -> str:
-    return " ".join(str(value or "").split()).strip()
+    return " ".join(_MODEL_TOKENS.sub(" ", str(value or "")).split()).strip()
 
 
 def suggest_topics(provider: BaseAIProvider, content_type: str, category: str, user_input: str, count: int = 6) -> list[dict]:
@@ -141,20 +146,25 @@ def fit_script_duration(provider: BaseAIProvider | None, content_type: str, cate
             break
         direction = "kéo dài" if seconds < target_seconds else "rút ngắn"
         report(f"AI {direction} kịch bản (lần {attempt + 1})")
-        script = adjust_length(provider, content_type, category, script, target_seconds / seconds, style)
+        try:
+            script = adjust_length(provider, content_type, category, script, target_seconds / seconds, style)
+        except (ProviderResponseError, ProviderTimeout) as error:
+            # Keep the script already written (and measured) rather than losing it; the rate still adjusts it.
+            logger.warning("adjust_length_failed attempt=%d reason=%s", attempt + 1, error)
+            report("AI chỉnh độ dài không thành công, giữ bản kịch bản hiện có")
+            break
         seconds = timing.measure(timing.narration(script), voice)
         report(f"Đo lại: {seconds:.1f}s")
     fitted = timing.fit_rate(timing.narration(script), voice, target_seconds, progress, measured_seconds=seconds)
     return {**script, "timing": fitted}
 
 
-def split_scenes(provider: BaseAIProvider, title: str, topic: str, hook: str, body: str,
-                 duration_seconds: int) -> dict:
-    """Returns {"subject": {"vi", "en"}, "scenes": [...]}; each scene carries Vietnamese and English image keywords."""
-    count = catalog.scene_count(duration_seconds)
-    data = provider.generate_json(*prompts.scenes(title, topic, f"{hook}\n\n{body}", count),
-                                  prompts.SCENES_SCHEMA, temperature=0.4)
-    subject = {"vi": _clean(data.get("subject_vi")), "en": _clean(data.get("subject_en"))}
+# Up to this many scenes are split in one AI call; longer videos are split paragraph by paragraph, because one
+# long answer made local models time out or drop scenes (300 s video = 38 scenes).
+SINGLE_CALL_SCENES = 12
+
+
+def _parse_scenes(data: dict, subject: dict, title: str) -> list[dict]:
     scenes = []
     for item in data.get("scenes") or []:
         if not isinstance(item, dict):
@@ -171,11 +181,70 @@ def split_scenes(provider: BaseAIProvider, title: str, topic: str, hook: str, bo
                 "image_prompt": prompt or query_en or text,
                 "image": None,
             })
-    if len(scenes) < 2:
-        raise ProviderResponseError("AI chia cảnh không hợp lệ. Hãy chia lại.")
-    if len(scenes) != count:
-        logger.info("scene_count_mismatch expected=%d got=%d", count, len(scenes))
-    return {"subject": subject, "scenes": scenes}
+    return scenes
+
+
+def _share_scenes(parts: list[str], count: int) -> list[int]:
+    """Scenes per part, proportional to its words (largest remainder), at least one each."""
+    words = [max(1, word_count(part)) for part in parts]
+    count = max(count, len(parts))
+    exact = [count * size / sum(words) for size in words]
+    shares = [max(1, int(value)) for value in exact]
+    order = sorted(range(len(parts)), key=lambda index: exact[index] - int(exact[index]), reverse=True)
+    for index in order:
+        if sum(shares) >= count:
+            break
+        shares[index] += 1
+    while sum(shares) > count:
+        largest = max(range(len(shares)), key=lambda index: shares[index])
+        shares[largest] -= 1
+    return shares
+
+
+def split_scenes(provider: BaseAIProvider, title: str, topic: str, hook: str, body: str,
+                 duration_seconds: int, progress=None) -> dict:
+    """Returns {"subject": {"vi", "en"}, "scenes": [...], "warnings": [...]}.
+
+    Each scene carries Vietnamese and English image keywords. Long videos are split one paragraph at a time;
+    a paragraph the AI cannot split becomes a single scene with the video's main keywords (listed in warnings).
+    """
+    count = catalog.scene_count(duration_seconds)
+    if count <= SINGLE_CALL_SCENES:
+        data = provider.generate_json(*prompts.scenes(title, topic, f"{hook}\n\n{body}", count),
+                                      prompts.SCENES_SCHEMA, temperature=0.4)
+        subject = {"vi": _clean(data.get("subject_vi")), "en": _clean(data.get("subject_en"))}
+        scenes = _parse_scenes(data, subject, title)
+        if len(scenes) < 2:
+            raise ProviderResponseError("AI chia cảnh không hợp lệ. Hãy chia lại.")
+        if len(scenes) != count:
+            logger.info("scene_count_mismatch expected=%d got=%d", count, len(scenes))
+        return {"subject": subject, "scenes": scenes, "warnings": []}
+
+    parts = [hook] + _paragraphs(body)
+    shares = _share_scenes(parts, count)
+    subject = {"vi": "", "en": ""}
+    scenes, warnings = [], []
+    for number, (part, share) in enumerate(zip(parts, shares), 1):
+        if progress:
+            progress(f"Chia cảnh phần {number}/{len(parts)}", -1)
+        try:
+            data = provider.generate_json(*prompts.scenes(title, topic, part, share), prompts.SCENES_SCHEMA,
+                                          temperature=0.4)
+            if not subject["vi"]:
+                subject = {"vi": _clean(data.get("subject_vi")), "en": _clean(data.get("subject_en"))}
+            found = _parse_scenes(data, subject, title)
+        except (ProviderResponseError, ProviderTimeout) as error:
+            logger.warning("scene_part_failed part=%d reason=%s", number, error)
+            found = []
+        if not found:
+            warnings.append(f"Phần {number}: AI không chia được, dùng 1 cảnh với từ khóa chung — nên sửa từ khóa.")
+            found = [{"text": part, "image_query_vi": subject["vi"] or title, "image_query_en": subject["en"] or title,
+                      "image_prompt": subject["en"] or title, "image": None}]
+        scenes.extend(found)
+    if not subject["vi"]:
+        subject = {"vi": title, "en": title}
+    logger.info("scenes_split_by_part parts=%d expected=%d got=%d", len(parts), count, len(scenes))
+    return {"subject": subject, "scenes": scenes, "warnings": warnings}
 
 
 class ScriptImportError(ValueError):

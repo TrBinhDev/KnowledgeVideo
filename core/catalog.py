@@ -16,7 +16,9 @@ CONTENT_TYPES = {
     },
 }
 
-DURATIONS = (60, 90, 120, 180)
+# Suggested lengths; any whole number of seconds in MIN_DURATION..MAX_DURATION can be typed.
+DURATIONS = (60, 90, 120, 180, 300)
+MIN_DURATION, MAX_DURATION = 30, 300
 
 VOICES = {
     "vi-VN-HoaiMyNeural": "Hoài My (nữ)",
@@ -91,7 +93,8 @@ def style_instruction(style: str | None) -> str:
 
 
 def scene_count(duration_seconds: int) -> int:
-    return max(4, min(12, round(duration_seconds / 8)))
+    # About one picture every 8 s; the cap only matters for the longest (300 s) videos.
+    return max(4, min(40, round(duration_seconds / 8)))
 
 
 def category_info(content_type: str, category: str) -> dict:

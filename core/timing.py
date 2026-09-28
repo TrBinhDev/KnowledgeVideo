@@ -1,9 +1,8 @@
-import asyncio
 import logging
 import tempfile
 from pathlib import Path
 
-from core.video_pipeline import probe, synthesize
+from core.video_pipeline import probe, run_tts, synthesize
 
 logger = logging.getLogger("kv.timing")
 
@@ -27,7 +26,7 @@ def measure(text: str, voice: str, rate_percent: int = 0) -> float:
     with tempfile.TemporaryDirectory(prefix="kv_measure_") as directory:
         folder = Path(directory)
         for attempt in range(_ATTEMPTS):
-            cues = asyncio.run(asyncio.wait_for(synthesize(text, voice, folder, rate_text(rate_percent)), timeout=180))
+            cues = run_tts(synthesize(text, voice, folder, rate_text(rate_percent)), text)
             duration = float(probe(folder / "voice.mp3")["format"]["duration"])
             if duration >= cues[-1][0] + 0.5:
                 return duration

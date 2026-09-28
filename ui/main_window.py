@@ -137,6 +137,7 @@ class MainWindow(QMainWindow):
         self.render_thread: dict = {}
         self.preferred_look: tuple[str, str] | None = None
         self.last_export_dir = ""
+        self.scene_warnings: list[str] = []
 
         self.pages = QStackedWidget()
         for builder in (self._build_start, self._build_topic, self._build_script,
@@ -440,7 +441,7 @@ class MainWindow(QMainWindow):
         for cards, key in ((self.type_cards, "content_type"), (self.category_cards, "category")):
             if cards.findData(state.get(key)) >= 0:
                 cards.setCurrentIndex(cards.findData(state.get(key)))
-        self.duration_combo.setCurrentIndex(max(0, self.duration_combo.findData(state.get("duration"))))
+        self._show_duration(state.get("duration"))
         self.script_voice_combo.setCurrentIndex(max(0, self.script_voice_combo.findData(state.get("voice"))))
         if self.provider_cards.findData(state.get("provider")) >= 0:
             self.provider_cards.blockSignals(True)
@@ -613,6 +614,9 @@ class MainWindow(QMainWindow):
         refresh_models.clicked.connect(self._load_models)
         self.provider_cards.currentIndexChanged.connect(self._on_provider_changed)
         self.duration_combo = QComboBox()
+        self.duration_combo.setEditable(True)
+        self.duration_combo.setInsertPolicy(QComboBox.NoInsert)
+        self.duration_combo.setToolTip(f"Chọn sẵn hoặc gõ số giây ({catalog.MIN_DURATION}–{catalog.MAX_DURATION}).")
         for seconds in catalog.DURATIONS:
             self.duration_combo.addItem(f"{seconds} giây", seconds)
         self.duration_combo.setCurrentIndex(1)
@@ -711,20 +715,42 @@ class MainWindow(QMainWindow):
         source.body.addWidget(self.input_stack)
         return _scroll(kind, ai, source)
 
-    def _read_settings(self) -> None:
-        """Step 1 choices shared by every way of starting a video."""
+    def _duration(self) -> int | None:
+        """Length typed or picked in the duration box ("75", "75 giây"), None (with a message) when out of range."""
+        match = re.search(r"\d+", self.duration_combo.currentText())
+        seconds = int(match.group()) if match else 0
+        if not catalog.MIN_DURATION <= seconds <= catalog.MAX_DURATION:
+            QMessageBox.information(self, "Độ dài chưa hợp lệ",
+                                    f"Độ dài video phải từ {catalog.MIN_DURATION} đến {catalog.MAX_DURATION} giây.")
+            return None
+        return seconds
+
+    def _show_duration(self, seconds: int | None) -> None:
+        index = self.duration_combo.findData(seconds)
+        if index >= 0:
+            self.duration_combo.setCurrentIndex(index)
+        elif seconds:
+            self.duration_combo.setEditText(f"{seconds} giây")
+
+    def _read_settings(self) -> bool:
+        """Step 1 choices shared by every way of starting a video; False when the duration is invalid."""
+        duration = self._duration()
+        if duration is None:
+            return False
         self.state.update({
             "content_type": self.type_cards.currentData(), "category": self.category_cards.currentData(),
-            "duration": self.duration_combo.currentData(), "voice": self.script_voice_combo.currentData(),
+            "duration": duration, "voice": self.script_voice_combo.currentData(),
             "style": self.style_combo.currentData(), "points": self.points_combo.currentData(),
         })
+        return True
 
     def _read_start(self) -> str | None:
         text = self.input_edit.toPlainText().strip()
         if len(text) < 3:
             QMessageBox.information(self, "Thiếu nội dung", "Hãy nhập từ khóa hoặc chủ đề (ít nhất 3 ký tự).")
             return None
-        self._read_settings()
+        if not self._read_settings():
+            return None
         self.state.update({"input": text, "mode": "keywords"})
         self.state.pop("source", None)
         return text
@@ -756,7 +782,8 @@ class MainWindow(QMainWindow):
         if len(text) < 50:
             QMessageBox.information(self, "Nội dung quá ngắn", "Hãy nhập hoặc tải nội dung dài ít nhất vài câu.")
             return
-        self._read_settings()
+        if not self._read_settings():
+            return
         source, cut = sources.limit(text)
         mode = self.source_mode.currentData()
         title = sources.title_line(source) or " ".join(source.split()[:14])
@@ -836,7 +863,8 @@ class MainWindow(QMainWindow):
                 QMessageBox.warning(self, "Không đọc được file", type(error).__name__)
 
     def _apply_imported(self, imported: dict) -> None:
-        self._read_settings()
+        if not self._read_settings():
+            return
         script = imported["script"]
         self._start_run(script["title"][:90])
         self.state.update({"input": script["title"], "mode": "json"})
@@ -1196,7 +1224,7 @@ class MainWindow(QMainWindow):
         duration, topic = self.state["duration"], self.state.get("topic", "")
         self._run("AI đang chia cảnh...",
                   self._ai_job(lambda provider: steps.split_scenes(provider, script["title"], topic, script["hook"],
-                                                                   script["body"], duration)),
+                                                                   script["body"], duration, provider.notify)),
                   self._show_scenes)
 
     # ---------- step 4: scenes and images ----------
@@ -1270,6 +1298,8 @@ class MainWindow(QMainWindow):
     def _show_scenes(self, result: dict) -> None:
         self.state["image_subject"] = result["subject"]
         self.state["scenes"] = result["scenes"]
+        # Shown together with the image search messages, which follow right away.
+        self.scene_warnings = list(result.get("warnings") or [])
         self._save()
         self._refresh_scene_list()
         self._reset_from(SCENES_PAGE)
@@ -1365,8 +1395,9 @@ class MainWindow(QMainWindow):
     def _after_images(self, errors: list[str]) -> None:
         self._save()
         self._refresh_scene_list(self.scene_list.currentRow())
-        if errors:
-            QMessageBox.warning(self, "Một số cảnh chưa có ảnh", "\n".join(errors))
+        notes, self.scene_warnings = self.scene_warnings + errors, []
+        if notes:
+            QMessageBox.warning(self, "Cần kiểm tra một số cảnh", "\n".join(notes))
 
     def _next_wikimedia(self) -> None:
         row = self.scene_list.currentRow()

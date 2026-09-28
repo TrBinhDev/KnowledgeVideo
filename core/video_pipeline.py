@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 import edge_tts
 from edge_tts.exceptions import NoAudioReceived
 
-from core.catalog import TRANSITIONS
+from core.catalog import TRANSITIONS, WORDS_PER_SECOND
 from core.network_security import fetch_safe_bytes
 from core.title_cards import HISTORY_GRADES, HISTORY_TEMPLATES, HISTORY_TRANSITIONS, render_title_card
 
@@ -360,6 +360,8 @@ def _asset_kind(path: Path, info: dict) -> str:
     return "video" if any(stream.get("codec_type") == "video" for stream in info.get("streams", [])) else "image"
 
 
+# Edge TTS sometimes answers "no audio" for a minute or so; retries wait longer each time (None = give up).
+_TTS_RETRY_PAUSES = (5, 15, 30, None)
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?…])\s+|\n+")
 MIN_SCENE_SECONDS = 2.0
 
@@ -381,20 +383,34 @@ def align_words(text: str, words: list[tuple[float, float, str]]) -> list[tuple[
     tokens = [(index, token) for index, sentence in enumerate(_sentences(text)) for token in sentence.split()]
     keys = [_word_key(token) for _index, token in tokens]
     times: list = [None] * len(tokens)
-    pointer = 0
+    pointer, misses = 0, 0
     for start, end, word in words:
         key = _word_key(word)
-        for position in range(pointer, min(pointer + 6, len(tokens))):
+        # After several unmatched words (text read differently than written) look further ahead to catch up.
+        window = 6 if misses < 4 else 40
+        for position in range(pointer, min(pointer + window, len(tokens))):
             if keys[position] and keys[position] == key:
                 times[position] = (start, end)
-                pointer = position + 1
+                pointer, misses = position + 1, 0
                 break
-    last_end = 0.0
-    for position, value in enumerate(times):
-        if value is None:
-            following = next((times[later][0] for later in range(position + 1, len(times)) if times[later]), last_end)
-            times[position] = (last_end, max(last_end, following))
-        last_end = times[position][1]
+        else:
+            misses += 1
+    # Unmatched runs share the time between their matched neighbours evenly, so no token gets zero length.
+    spoken_end = words[-1][1] if words else 0.0
+    position = 0
+    while position < len(times):
+        if times[position] is not None:
+            position += 1
+            continue
+        run_end = position
+        while run_end < len(times) and times[run_end] is None:
+            run_end += 1
+        begin = times[position - 1][1] if position else 0.0
+        finish = times[run_end][0] if run_end < len(times) else max(spoken_end, begin)
+        step = max(0.0, finish - begin) / (run_end - position)
+        for offset, index in enumerate(range(position, run_end)):
+            times[index] = (begin + offset * step, begin + (offset + 1) * step)
+        position = run_end
     return [(index, token, start, end) for (index, token), (start, end) in zip(tokens, times)]
 
 
@@ -403,8 +419,25 @@ def _sentence_cues(text: str, tokens) -> list[tuple[float, float, str]]:
     for index, _token, start, end in tokens:
         span = spans.setdefault(index, [start, end])
         span[0], span[1] = min(span[0], start), max(span[1], end)
-    return [(spans[index][0], spans[index][1], sentence) for index, sentence in enumerate(_sentences(text))
+    cues = [[spans[index][0], spans[index][1], sentence] for index, sentence in enumerate(_sentences(text))
             if index in spans]
+    # Last resort: sentences squeezed onto one instant share the time up to the next distinct start by length.
+    index = 0
+    while index < len(cues):
+        run_end = index + 1
+        while run_end < len(cues) and cues[run_end][0] <= cues[index][0] + 0.05:
+            run_end += 1
+        finish = cues[run_end][0] if run_end < len(cues) else max(cue[1] for cue in cues[index:run_end])
+        if run_end - index > 1 or finish - cues[index][0] < 0.05:
+            finish = max(finish, cues[index][0] + 0.3 * (run_end - index))
+            sizes = [max(1, len(cue[2])) for cue in cues[index:run_end]]
+            moment = cues[index][0]
+            for cue, size in zip(cues[index:run_end], sizes):
+                share = (finish - cues[index][0]) * size / sum(sizes)
+                cue[0], cue[1] = moment, moment + share
+                moment += share
+        index = run_end
+    return [tuple(cue) for cue in cues]
 
 
 def scene_starts(cues, scene_texts: list[str], duration: float, minimum: float = MIN_SCENE_SECONDS) -> list[float]:
@@ -506,6 +539,18 @@ def highlight_subtitles(tokens, start_after: float, duration: float, max_chars: 
     return _ASS_HEADER + "\n".join(events) + "\n"
 
 
+def run_tts(coroutine, text: str):
+    """Run a synthesize() call with a wait that grows with the narration.
+
+    Edge TTS streams at about real-time speed or slower, so a fixed 180 s limit failed for 5-minute videos.
+    """
+    limit = 180 + 2 * len(text.split()) / WORDS_PER_SECOND
+    try:
+        return asyncio.run(asyncio.wait_for(coroutine, timeout=limit))
+    except TimeoutError as error:
+        raise RuntimeError(f"Edge TTS phản hồi quá chậm (quá {limit:.0f} giây). Kiểm tra mạng rồi thử lại.") from error
+
+
 async def synthesize(text, voice, directory, rate="+0%", word_cues: list | None = None):
     """Speak `text` into voice.mp3 and return sentence cues (start, end, text).
 
@@ -513,7 +558,7 @@ async def synthesize(text, voice, directory, rate="+0%", word_cues: list | None 
     sentence cues are rebuilt from them.
     """
     boundary = "WordBoundary" if word_cues is not None else "SentenceBoundary"
-    for attempt in range(3):
+    for attempt, pause in enumerate(_TTS_RETRY_PAUSES):
         cues = []
         communicator = edge_tts.Communicate(text, voice, rate=rate, boundary=boundary)
         try:
@@ -525,10 +570,12 @@ async def synthesize(text, voice, directory, rate="+0%", word_cues: list | None 
                         cues.append((chunk["offset"] / 10000000,
                                      (chunk["offset"] + chunk["duration"]) / 10000000,
                                      html.unescape(chunk["text"])))
-        except NoAudioReceived:
-            if attempt == 2:
-                raise
-            await asyncio.sleep(1.5 * (attempt + 1))
+        except NoAudioReceived as error:
+            if pause is None:
+                raise RuntimeError("Edge TTS tạm thời không trả giọng đọc (đã thử lại nhiều lần). "
+                                   "Đợi một lát rồi thử lại.") from error
+            logger.warning("tts_no_audio attempt=%d retry_in=%ss", attempt + 1, pause)
+            await asyncio.sleep(pause)
             continue
         if not cues or not (directory / "voice.mp3").stat().st_size:
             raise RuntimeError("TTS không trả audio hoặc mốc phụ đề.")
@@ -614,8 +661,8 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
     words: list | None = [] if subtitle_mode == "highlight" else None
     for attempt in range(_TTS_ATTEMPTS):
         options = {"word_cues": words} if words is not None else {}
-        cues = asyncio.run(asyncio.wait_for(
-            tts(narration, snapshot["voice"], directory, snapshot.get("tts_rate", "+0%"), **options), timeout=180))
+        cues = run_tts(tts(narration, snapshot["voice"], directory, snapshot.get("tts_rate", "+0%"), **options),
+                       narration)
         duration = float(probe(directory / "voice.mp3")["format"]["duration"])
         # Edge TTS can drop the audio stream mid-way while still returning every sentence boundary.
         if duration >= cues[-1][0] + 0.5:
