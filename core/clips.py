@@ -23,7 +23,7 @@ import yt_dlp
 from core.ai import BaseAIProvider
 from core.config import output_directory
 from core.network_security import fetch_safe_bytes
-from core.video_pipeline import RenderCancelled, check_cancelled, probe, run_media
+from core.video_pipeline import RenderCancelled, check_cancelled, probe, run_media, run_parallel
 
 logger = logging.getLogger("kv.clips")
 
@@ -51,6 +51,12 @@ MAX_SHOTS = 60
 MAX_SOURCE_SECONDS = 3 * 3600
 # A short shot is slowed down at most this much to fill its scene; beyond that the render loops it.
 MAX_SLOWDOWN = 1.6
+# Work done a few at a time: online vision calls (kept low for gateway rate limits), candidate videos looked at,
+# shot frames taken and HQ ranges downloaded.
+GEMINI_VISION_WORKERS = 3
+CANDIDATE_WORKERS = 3
+THUMBNAIL_WORKERS = 4
+DOWNLOAD_WORKERS = 3
 
 
 class ClipError(Exception):
@@ -232,7 +238,13 @@ def gemini_vision(provider):
     def look(prompt: str, image_paths: list[Path], schema: dict) -> dict:
         return provider.generate_json_images(prompt, image_paths, schema)
 
+    look.workers = GEMINI_VISION_WORKERS
     return look
+
+
+def _vision_workers(vision) -> int:
+    """How many images to look at at once: an online model answers in parallel, the local Ollama one by one."""
+    return getattr(vision, "workers", 1)
 
 
 def ollama_vision(prompt: str, image_paths: list[Path], schema: dict) -> dict:
@@ -330,25 +342,34 @@ def find_candidates(query: str, content_filter: str, progress=None, limit: int =
         found = [item for item in found if not _is_unreal_title(item["title"])]
     found = [item for item in found if 45 <= item["duration"] <= MAX_SOURCE_SECONDS][:limit]
     boards = cache_directory() / "boards"
-    candidates = []
-    for number, item in enumerate(found, 1):
+    looked = []
+
+    def look_at(item: dict) -> dict | None:
         check_cancelled()
-        if progress:
-            progress(f"Xem thử video {number}/{len(found)}: {item['title'][:50]}", round(100 * (number - 1) / max(1, len(found))))
         try:
             info = video_info(item["id"])
             sheet = storyboard_sheet(info, boards)
             kind, watermark = classify(sheet, vision) if sheet else ("slides", False)
         except ClipError as error:
             logger.info("clip_candidate_skipped id=%s reason=%s", item["id"], error)
-            continue
+            return None
         except RenderCancelled:
             raise
         except (OSError, ValueError, RuntimeError) as error:
             logger.info("clip_candidate_skipped id=%s reason=%s", item["id"], type(error).__name__)
-            continue
-        candidates.append({**_source_fields(info), "kind": kind, "watermark": watermark,
-                           "allowed": kind in allowed, "board": str(sheet) if sheet else ""})
+            return None
+        finally:
+            looked.append(item["id"])
+            if progress:
+                progress(f"Đã xem thử {len(looked)}/{len(found)} video: {item['title'][:50]}",
+                         round(100 * len(looked) / max(1, len(found))))
+        return {**_source_fields(info), "kind": kind, "watermark": watermark,
+                "allowed": kind in allowed, "board": str(sheet) if sheet else ""}
+
+    if progress:
+        progress(f"Xem thử {len(found)} video", 0)
+    # Reading a video's page and its storyboard is mostly waiting on YouTube, so several are looked at at once.
+    candidates = [item for item in run_parallel(look_at, found, CANDIDATE_WORKERS) if item]
     candidates.sort(key=lambda item: not item["allowed"])
     return candidates
 
@@ -418,12 +439,16 @@ def detect_shots(path: Path, duration: float, threshold: float = 0.3) -> list[di
 
 def shot_thumbnails(path: Path, shots: list[dict], directory: Path, prefix: str) -> None:
     directory.mkdir(parents=True, exist_ok=True)
-    for index, shot in enumerate(shots):
-        name = f"{prefix}_{index:03d}.jpg"
+
+    def take(index: int) -> None:
+        shot, name = shots[index], f"{prefix}_{index:03d}.jpg"
         middle = (shot["start"] + shot["end"]) / 2
         run_media(["ffmpeg", "-y", "-nostdin", "-v", "error", "-ss", f"{middle:.3f}", "-i", str(path),
                    "-frames:v", "1", "-vf", "scale=320:-2", "-q:v", "4", name], directory, 60)
         shot["thumb"] = name
+
+    # One short ffmpeg run per frame (fast seek); starting the process is most of its time, so several run at once.
+    run_parallel(take, range(len(shots)), THUMBNAIL_WORKERS)
 
 
 _LOGO_W, _LOGO_H = 192, 108
@@ -512,16 +537,23 @@ def prepare_source(video_id: str, thumbs_directory: Path, progress=None) -> dict
     path = analysis_copy(video_id)
     logger.info("clip_analysis_copy size=%.1fMB took=%.1fs", path.stat().st_size / 1e6, time.monotonic() - started)
     check_cancelled()
-    report("Tách shot", 45)
-    shots = detect_shots(path, source["duration"])
-    if not shots:
-        raise ClipError("Không tách được shot nào đủ dài từ video này.")
-    logger.info("clip_shots count=%d (max %d)", len(shots), MAX_SHOTS)
-    report(f"Tạo ảnh cho {len(shots)} shot", 60)
-    shot_thumbnails(path, shots, thumbs_directory, video_id)
-    report("Dò logo/watermark", 85)
-    logos = detect_logos(path, source["duration"])
+
+    def shots_with_frames() -> list[dict]:
+        report("Tách shot (song song dò logo/watermark)", 45)
+        found = detect_shots(path, source["duration"])
+        if not found:
+            raise ClipError("Không tách được shot nào đủ dài từ video này.")
+        logger.info("clip_shots count=%d (max %d)", len(found), MAX_SHOTS)
+        report(f"Tạo ảnh cho {len(found)} shot", 70)
+        shot_thumbnails(path, found, thumbs_directory, video_id)
+        return found
+
+    # Both read the whole 360p copy; the logo scan runs alongside the shot split and frames.
+    started = time.monotonic()
+    shots, logos = run_parallel(lambda task: task(), [shots_with_frames,
+                                                      lambda: detect_logos(path, source["duration"])], 2)
     logger.info("clip_logos count=%d boxes=%s", len(logos), logos)
+    logger.info("clip_prepare_analysis took=%.1fs", time.monotonic() - started)
     report(f"Xong: {len(shots)} shot, {len(logos)} vùng logo", 100)
     return {**source, "shots": shots, "logos": logos, "logos_from": "auto"}
 
@@ -561,13 +593,18 @@ def _contact_sheet(paths: list[Path], output: Path) -> None:
 
 
 def describe_shots(source: dict, thumbs_directory: Path, progress=None, vision=ollama_vision) -> None:
-    """Short English description of each shot (fills shot["desc"]), nine shots per vision call."""
+    """Short English description of each shot (fills shot["desc"]), nine shots per vision call; several calls at
+    once when the vision model is online."""
     shots = source["shots"]
     groups = [list(range(start, min(start + 9, len(shots)))) for start in range(0, len(shots), 9)]
-    for number, group in enumerate(groups, 1):
+    workers = _vision_workers(vision)
+    finished = []
+    if progress:
+        progress(f"AI xem {len(shots)} shot ({len(groups)} lưới, {workers} lưới cùng lúc)", 0)
+
+    def describe(number: int) -> None:
         check_cancelled()
-        if progress:
-            progress(f"AI xem shot {group[0] + 1}-{group[-1] + 1}/{len(shots)}", round(100 * (number - 1) / len(groups)))
+        group = groups[number - 1]
         sheet = thumbs_directory / f"_grid_{number}.jpg"
         _contact_sheet([thumbs_directory / shots[index]["thumb"] for index in group], sheet)
         prompt = (f"This image is a 3x3 grid of {len(group)} numbered video frames (yellow numbers 1-{len(group)}, "
@@ -581,6 +618,12 @@ def describe_shots(source: dict, thumbs_directory: Path, progress=None, vision=o
         for item in data.get("frames") or []:
             if isinstance(item, dict) and isinstance(item.get("n"), int) and 1 <= item["n"] <= len(group):
                 shots[group[item["n"] - 1]]["desc"] = " ".join(str(item.get("desc") or "").split())[:160]
+        finished.append(number)
+        if progress:
+            progress(f"AI đã xem {len(finished)}/{len(groups)} lưới (shot {group[0] + 1}-{group[-1] + 1})",
+                     round(100 * len(finished) / len(groups)))
+
+    run_parallel(describe, range(1, len(groups) + 1), workers)
 
 
 def scene_seconds(scenes: list[dict], total: float) -> list[float]:
@@ -827,8 +870,10 @@ def prepare_render_clips(state: dict, assets: Path, resolution: str, total_secon
     scenes = state["scenes"]
     needs = segment_needs(scenes, total_seconds)
     todo = [index for index, scene in enumerate(scenes) if scene.get("clip")]
-    for number, index in enumerate(todo, 1):
-        progress("prepare_clips", round(2 + 8 * (number - 1) / max(1, len(todo))))
+    finished = []
+    progress("prepare_clips", 2)
+
+    def cut(index: int) -> None:
         clip = scenes[index]["clip"]
         # Scenes matched before segments existed hold only a shot: they use that shot's own range.
         shot = source["shots"][clip["shot"]]
@@ -836,14 +881,20 @@ def prepare_render_clips(state: dict, assets: Path, resolution: str, total_secon
         output = assets / f"scene_{index:02d}_clip_{target_h}.mp4"
         cut_key = [source["id"], span["start"], span["end"], source.get("logos") or []]
         # Reused when the same range was already cut the same way (e.g. re-rendering with another template).
-        if clip.get("file") == output.name and clip.get("cut_key") == cut_key and output.is_file():
-            continue
-        clip.pop("file", None)
-        started = time.monotonic()
-        result = cut_scene_clip(source, span, needs[index], target_w, target_h, output)
-        clip.update({**result, "cut_key": cut_key})
-        logger.info("scene_clip index=%d range=%.1f-%.1fs took=%.1fs blurred=%d", index, span["start"], span["end"],
-                    time.monotonic() - started, result["blurred"])
+        if not (clip.get("file") == output.name and clip.get("cut_key") == cut_key and output.is_file()):
+            clip.pop("file", None)
+            started = time.monotonic()
+            result = cut_scene_clip(source, span, needs[index], target_w, target_h, output)
+            clip.update({**result, "cut_key": cut_key})
+            logger.info("scene_clip index=%d range=%.1f-%.1fs took=%.1fs blurred=%d", index, span["start"],
+                        span["end"], time.monotonic() - started, result["blurred"])
+        finished.append(index)
+        progress("prepare_clips", round(2 + 8 * len(finished) / max(1, len(todo))))
+
+    # Each range is a separate YouTube download (page, links, then the bytes): a few at once.
+    started = time.monotonic()
+    run_parallel(cut, todo, DOWNLOAD_WORKERS)
+    logger.info("scene_clips_ready count=%d took=%.1fs", len(todo), time.monotonic() - started)
 
 
 def release_source(source: dict) -> None:

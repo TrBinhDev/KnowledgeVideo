@@ -4,6 +4,7 @@ from pathlib import Path
 
 from core import catalog
 from core.config import RunStore
+from core.timing import reuse_or_synthesize
 from core.video_pipeline import render, run_media
 
 
@@ -91,7 +92,7 @@ def build_snapshot(state: dict, render_options: dict, music_file: str, tts_rate:
 
 
 def render_video(store: RunStore, snapshot: dict, stage) -> Path:
-    render(snapshot, store.render, store.directory, stage)
+    render(snapshot, store.render, store.directory, stage, tts=reuse_or_synthesize)
     video = store.render / "final.mp4"
     make_thumbnail(video)
     return video

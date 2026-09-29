@@ -8,6 +8,7 @@ import shutil
 import subprocess
 import textwrap
 import threading
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -30,6 +31,7 @@ _VIDEO_FPS = 30
 _MAX_ARTICLE_IMAGES = 16
 _TTS_ATTEMPTS = 3
 TRANSITION_SECONDS = 0.6
+MOTION_WORKERS = 3
 _qt_application = None
 
 
@@ -119,6 +121,41 @@ class RenderCancelled(RuntimeError):
 _processes: dict[int, set] = {}
 _cancelled: set[int] = set()
 _process_lock = threading.Lock()
+# Helper threads of run_parallel -> the worker thread they work for: its cancel stops them too.
+_owners: dict[int, int] = {}
+
+
+def _owner() -> int:
+    ident = threading.get_ident()
+    return _owners.get(ident, ident)
+
+
+def run_parallel(function, items, workers: int = 3) -> list:
+    """function(item) for every item on up to `workers` threads; results in item order. Cancelling the calling
+    worker thread also cancels the helpers (their ffmpeg is killed, their next check_cancelled raises)."""
+    items = list(items)
+    if workers <= 1 or len(items) <= 1:
+        return [function(item) for item in items]
+    owner = _owner()
+
+    def call(item):
+        ident = threading.get_ident()
+        with _process_lock:
+            _owners[ident] = owner
+        try:
+            return function(item)
+        finally:
+            with _process_lock:
+                _owners.pop(ident, None)
+
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(call, item) for item in items]
+        try:
+            return [future.result() for future in futures]
+        except BaseException:
+            for future in futures:
+                future.cancel()
+            raise
 
 
 def cancel_thread(thread_id: int) -> None:
@@ -145,12 +182,12 @@ def clear_cancel(thread_id: int) -> None:
 
 
 def check_cancelled() -> None:
-    if threading.get_ident() in _cancelled:
+    if _owner() in _cancelled:
         raise RenderCancelled("Đã hủy render.")
 
 
 def _start(arguments, **options) -> subprocess.Popen:
-    thread_id = threading.get_ident()
+    thread_id = _owner()
     with _process_lock:
         if thread_id in _cancelled:
             raise RenderCancelled("Đã hủy render.")
@@ -162,7 +199,7 @@ def _start(arguments, **options) -> subprocess.Popen:
 
 def _release(process: subprocess.Popen) -> None:
     with _process_lock:
-        _processes.get(threading.get_ident(), set()).discard(process)
+        _processes.get(_owner(), set()).discard(process)
 
 
 def render_motion_scene(source: Path, output: Path, width: int, height: int,
@@ -871,16 +908,16 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
         # Each scene but the last runs on through the transition into the next one.
         return lengths[index] + (overlap if index < len(asset_entries) - 1 else 0.0)
 
-    render_entries = asset_entries
-    if asset_entries:
-        render_entries = []
-        for index, (path, info, kind) in enumerate(asset_entries):
-            if kind == "image":
-                motion_path = directory / f"motion_scene_{index}.mp4"
-                render_motion_scene(path, motion_path, width, height, scene_length(index), index)
-                render_entries.append((motion_path, probe(motion_path), "video"))
-            else:
-                render_entries.append((path, info, kind))
+    def motion_entry(index: int):
+        path, info, kind = asset_entries[index]
+        if kind != "image":
+            return path, info, kind
+        motion_path = directory / f"motion_scene_{index}.mp4"
+        render_motion_scene(path, motion_path, width, height, scene_length(index), index)
+        return motion_path, probe(motion_path), "video"
+
+    # Qt draws the frames and x264 encodes them; a few scenes at once keep more CPU cores busy.
+    render_entries = run_parallel(motion_entry, range(len(asset_entries)), MOTION_WORKERS)
     command = ["ffmpeg", "-y", "-nostdin", "-v", "error"]
     if render_entries:
         for path, _info, kind in render_entries:
@@ -1041,7 +1078,7 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
     command += ["-filter_complex", ";".join(filter_complex), "-map", "[vout]", "-map", "[audio]",
                 "-t", str(duration), "-c:v", "libx264", "-preset",
                 os.environ.get("KV_FFMPEG_PRESET", "fast"),
-                "-crf", os.environ.get("KV_VIDEO_CRF", "20"), "-threads", "2",
+                "-crf", os.environ.get("KV_VIDEO_CRF", "20"),
                 "-pix_fmt", "yuv420p", "-c:a", "aac",
                 "-b:a", "128k", "-movflags", "+faststart", "render.mp4"]
     stage("ffmpeg_render", 70)
