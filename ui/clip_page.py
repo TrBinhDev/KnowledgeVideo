@@ -99,10 +99,11 @@ class ClipPage(QWidget):
     def __init__(self, window):
         super().__init__()
         self.window = window
+        # Source videos auto mode already prepared for this video (so a retry picks another one).
+        self.auto_tried: set[str] = set()
 
         source = Card("Video nguồn", "Cả video dùng các shot của 1 video nguồn nên màu và chất hình đồng đều. "
-                      "Tự tìm video Creative Commons (được phép dùng lại, phải ghi nguồn) theo từ khóa chủ đề, "
-                      "hoặc dán link YouTube bạn có quyền dùng.", "film")
+                      "Tìm video YouTube theo từ khóa chủ đề hoặc dán link video nguồn.", "film")
         self.query_edit = QLineEdit()
         self.query_edit.setPlaceholderText("Từ khóa chủ đề, ví dụ: Điện Biên Phủ 1954")
         self.filter_combo = QComboBox()
@@ -244,6 +245,7 @@ class ClipPage(QWidget):
         return self.state.get("clip_source")
 
     def reset(self) -> None:
+        self.auto_tried = set()
         for widget in (self.query_edit, self.link_edit):
             widget.clear()
         self.candidate_list.clear()
@@ -278,32 +280,99 @@ class ClipPage(QWidget):
             # Link given in step 1: use it straight away (it was validated there).
             self.link_edit.setText(link)
             self._prepare(clips.youtube_id(link))
+        elif self.window.auto_active:
+            self._auto_search()
         else:
             self.window.status.setText("Tìm hoặc dán link video nguồn để ghép clip cho các cảnh.")
 
     # ---------- source video ----------
 
-    def _search(self) -> None:
+    def _about(self) -> str:
+        """What the video is about, for scoring source videos: the script title and the topic."""
+        title = (self.state.get("script") or {}).get("title", "")
+        topic = self.state.get("topic", "")
+        return title if not topic or topic in title else f"{title} ({topic})"
+
+    def _search(self, then=None) -> None:
         query = self.query_edit.text().strip()
         if len(query) < 2:
             QMessageBox.information(self, "Thiếu từ khóa", "Nhập từ khóa chủ đề để tìm video.")
             return
         content_filter = self.filter_combo.currentData()
         self.state.update({"clip_query": query, "clip_filter": content_filter})
+        about = self._about()
 
         def done(candidates: list[dict]) -> None:
+            if then:
+                then(candidates)
+                return
             self.state["clip_candidates"] = candidates
             self.window._save()
             self._fill_candidates()
             if not candidates:
                 QMessageBox.information(self, "Không có video phù hợp",
-                                        "Không tìm được video Creative Commons dùng được. Thử từ khóa ngắn hơn, "
-                                        "tiếng Anh, hoặc dán link video bạn có quyền dùng.")
+                                        "Không tìm được video phù hợp. Thử từ khóa ngắn hơn, "
+                                        "tiếng Anh, hoặc dán link video nguồn.")
 
         self.window._run("Tìm video nguồn...",
                          self.window._step4_job(lambda provider, vision: clips.find_candidates(
-                             query, content_filter, provider.notify, vision=vision)),
+                             query, content_filter, provider.notify, vision=vision, about=about)),
                          done, cancellable=True)
+
+    def _auto_search(self, queries: list[str] | None = None) -> None:
+        """Auto mode: search with the suggested keywords (Vietnamese, then English) and prepare the video with the
+        best score; below clips.GOOD_SCORE the next keywords are tried, then the user is asked to choose."""
+        if queries is None:
+            suggested = self.state.get("video_query") or {}
+            queries = [query for query in dict.fromkeys((self.query_edit.text().strip(), suggested.get("en"))) if query]
+            self.state["clip_candidates"], self.auto_tried = [], set()
+        if not queries:
+            self.window.auto_stop("Chưa có từ khóa tìm video nguồn.")
+            return
+        self.query_edit.setText(queries[0])
+
+        def found(candidates: list[dict]) -> None:
+            # Results of every search so far stay in the list, best first.
+            merged = {item["id"]: item for item in (self.state.get("clip_candidates") or []) + candidates}
+            self.state["clip_candidates"] = sorted(merged.values(), key=lambda item: (not item["allowed"], -item["score"]))
+            self.window._save()
+            self._fill_candidates()
+            best = clips.best_candidate(self.state["clip_candidates"])
+            score = best["score"] if best else 0
+            if best and score >= clips.GOOD_SCORE:
+                self.window._log(f"Tự động: chọn video nguồn “{best['title'][:60]}” ({score}/10)")
+                self._select_candidate(best["id"])
+                self._prepare(best["id"])
+            elif len(queries) > 1:
+                self.window._log(f"Tự động: điểm cao nhất {score}/10 (< {clips.GOOD_SCORE}), tìm lại với “{queries[1]}”")
+                self._auto_search(queries[1:])
+            else:
+                self.window.auto_stop(f"Không tìm được video nguồn đủ hợp (điểm cao nhất {score}/10, cần từ "
+                                      f"{clips.GOOD_SCORE}). Chọn video trong danh sách, đổi từ khóa rồi tìm lại, "
+                                      "hoặc dán link video.")
+
+        self._search(then=found)
+
+    def _select_candidate(self, video_id: str) -> None:
+        for row in range(self.candidate_list.count()):
+            if self.candidate_list.item(row).data(Qt.UserRole) == video_id:
+                self.candidate_list.setCurrentRow(row)
+                return
+
+    def _retry_source(self, chosen: list[dict | None], warnings: list[str], video_id: str) -> bool:
+        """Auto mode: when the source fits badly (the AI matched few scenes), prepare the next best video once."""
+        if not self.window.auto_active:
+            return False
+        self.auto_tried.add(video_id)
+        weak = clips.WEAK_MATCH_WARNING in warnings or sum(clip is None for clip in chosen) > len(chosen) / 2
+        following = clips.best_candidate(self.state.get("clip_candidates") or [], self.auto_tried)
+        if not weak or len(self.auto_tried) > 1 or not following or following["score"] < clips.GOOD_SCORE:
+            return False
+        self.window._log(f"Tự động: video nguồn ghép được ít cảnh, thử video “{following['title'][:60]}” "
+                         f"({following['score']}/10)")
+        self._select_candidate(following["id"])
+        self._prepare(following["id"])
+        return True
 
     def _use_suggested_query(self, language: str) -> None:
         text = (self.state.get("video_query") or {}).get(language)
@@ -315,8 +384,9 @@ class ClipPage(QWidget):
         for candidate in self.state.get("clip_candidates") or []:
             kind = clips.KIND_LABELS.get(candidate.get("kind"), "?")
             logo = "có logo" if candidate.get("watermark") else "không thấy logo"
-            lines = [candidate["title"], f"{candidate['channel']} · {_clock(candidate['duration'])} ·  BY",
-                     f"AI xem: {kind}, {logo}"]
+            score = f", hợp chủ đề {candidate['score']}/10" if "score" in candidate else ""
+            lines = [candidate["title"], f"{candidate['channel']} · {_clock(candidate['duration'])}",
+                     f"AI xem: {kind}, {logo}{score}"]
             if not candidate.get("allowed"):
                 lines.append("Không hợp bộ lọc loại nguồn")
             item = QListWidgetItem("\n".join(lines))
@@ -362,6 +432,8 @@ class ClipPage(QWidget):
             self.state["clip_source"] = source
             self._apply(chosen)
             self._show_source()
+            if self._retry_source(chosen, warnings, video_id):
+                return
             self._fill_pictures(warnings)
 
         self.window._run("Chuẩn bị video nguồn (tải 360p, tách shot, AI xem)...", self.window._step4_job(call), done,
@@ -375,11 +447,9 @@ class ClipPage(QWidget):
             self.source_info.setText("Chưa chọn video nguồn.")
             self.logo_info.setText("")
             return
-        license_text = "CC BY (ghi nguồn khi đăng)" if clips.is_creative_commons(source.get("license", "")) \
-            else "Không rõ giấy phép — chỉ dùng video bạn có quyền dùng"
         self.source_info.setText(
             f"<b>{html.escape(source['title'])}</b><br>{html.escape(source['channel'])} · {_clock(source['duration'])} · "
-            f"{len(source['shots'])} shot · {license_text} · "
+            f"{len(source['shots'])} shot · "
             f"<a href=\"{html.escape(source['url'], quote=True)}\">Mở trên YouTube</a>")
         logos = source.get("logos") or []
         origin = "tự dò" if source.get("logos_from") == "auto" else "bạn khoanh"
@@ -464,8 +534,8 @@ class ClipPage(QWidget):
         scenes = self.state["scenes"]
         todo = [index for index, scene in enumerate(scenes) if not scene.get("clip") and not scene.get("image")]
         if not todo:
-            if notes:
-                QMessageBox.warning(self, "Cần kiểm tra một số cảnh", "\n".join(notes))
+            self.window.scene_notice(notes)
+            self.window.scenes_done()
             return
         store, topic = self.window.store, self.state.get("topic", "")
         title = (self.state.get("script") or {}).get("title", topic)
@@ -487,8 +557,8 @@ class ClipPage(QWidget):
         def done(errors: list[str]) -> None:
             self.window._save()
             self.refresh_scenes(self.scene_list.currentRow())
-            if notes or errors:
-                QMessageBox.warning(self, "Cần kiểm tra một số cảnh", "\n".join(notes + errors))
+            self.window.scene_notice(notes + errors)
+            self.window.scenes_done()
 
         self.window._run("Tìm ảnh cho cảnh không có shot hợp", job, done)
 

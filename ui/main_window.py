@@ -19,9 +19,9 @@ from PySide6.QtWidgets import (
 
 from core import catalog, clips, images, sources, steps, timing, video_pipeline
 from core.ai import build_provider, default_model, list_models
-from core.config import RunStore, output_directory, slug
+from core.config import RunStore, list_runs, output_directory, slug
 from core.preview import SCENES, render_preview, render_thumbnail, run_source
-from core.render import _source_label, build_snapshot, export_video, import_music, make_thumbnail, render_video
+from core.render import build_snapshot, export_video, import_music, make_thumbnail, render_video
 from core.video_pipeline import transition_names
 from ui import icons
 from ui.clip_page import VISION_CHOICES, ClipPage
@@ -57,8 +57,8 @@ FLOW_TEXTS = {
     },
     "clip": {
         "icon": "film", "title": "Video clip",
-        "text": "Mỗi cảnh là 1 shot cắt từ 1 video YouTube (video Creative Commons tìm theo chủ đề, hoặc link bạn "
-                "dán), crop 9:16, che logo, thay tiếng gốc bằng giọng đọc kịch bản.",
+        "text": "Mỗi cảnh là 1 shot cắt từ 1 video YouTube (tìm theo chủ đề hoặc dán link), "
+                "crop 9:16, che logo, thay tiếng gốc bằng giọng đọc kịch bản.",
         "card": ("Nội dung & video nguồn", "Kịch bản viết như luồng ảnh; video nguồn dán link ngay dưới đây, hoặc để "
                  "app tìm ở bước Cảnh & clip."),
         "example": "Ví dụ: chiến dịch Điện Biên Phủ 1954, Vịnh Hạ Long",
@@ -197,6 +197,9 @@ class MainWindow(QMainWindow):
         self.preferred_look: tuple[str, str] | None = None
         self.last_export_dir = ""
         self.scene_warnings: list[str] = []
+        # Auto mode of the video being made (step 1 checkbox): each step starts the next one by itself.
+        self.auto_active = False
+        self.auto_notes: list[str] = []
 
         self.pages = QStackedWidget()
         for builder in (self._build_start, self._build_topic, self._build_script,
@@ -510,6 +513,7 @@ class MainWindow(QMainWindow):
         self.render_panel.setVisible(False)
         self.done_bar.setVisible(False)
         self.clip_page.reset()
+        self.auto_active, self.auto_notes = False, []
 
     def _new_video(self) -> None:
         if self.busy:
@@ -679,6 +683,7 @@ class MainWindow(QMainWindow):
         if "id" in self.task_worker:
             video_pipeline.cancel_thread(self.task_worker["id"])
         self.job_number += 1
+        self.auto_active = False
         self._log("Đã hủy theo yêu cầu (việc đang chạy dở sẽ tự dừng ở nền)")
         self._finish(False, "Đã hủy")
 
@@ -701,6 +706,9 @@ class MainWindow(QMainWindow):
             self._show_done_bar()
             return
         self._finish(False, "Lỗi: " + message)
+        if self.auto_active:
+            # Pressing this step's button again continues the automatic run from here.
+            self._log("Tự động tạm dừng vì lỗi; bấm lại bước vừa lỗi để chạy tiếp")
         if self.render_active:
             self.render_active = False
             self.render_panel.finish(False, message)
@@ -859,7 +867,8 @@ class MainWindow(QMainWindow):
         settings.setHorizontalSpacing(12)
         settings.setVerticalSpacing(4)
         settings.addWidget(_field("Model"), 0, 0)
-        settings.addWidget(_field("Độ dài video"), 0, 2)
+        settings.addWidget(_field(f"Độ dài video <span style='color:#94a3b8; font-weight:400'>"
+                                  f"({catalog.MIN_DURATION}–{catalog.MAX_DURATION} giây)</span>"), 0, 2)
         settings.addWidget(_field("Giọng đọc"), 0, 3)
         settings.addWidget(self.model_combo, 1, 0)
         settings.addWidget(refresh_models, 1, 1)
@@ -889,6 +898,7 @@ class MainWindow(QMainWindow):
         settings.setColumnStretch(3, 2)
         ai.body.addWidget(self.provider_cards)
         ai.body.addLayout(settings)
+        ai.body.addWidget(self._build_auto_box())
 
         source = Card("Nhập nội dung / Từ khóa", "Nhập từ khóa để AI gợi ý chủ đề, hoặc đưa nội dung có sẵn "
                       "(bài viết, tài liệu) để làm video bám theo đúng tài liệu đó.", "search")
@@ -967,10 +977,10 @@ class MainWindow(QMainWindow):
         link_layout.setSpacing(6)
         link_layout.addWidget(_field("Link video nguồn (tùy chọn)"))
         self.clip_link_edit = QLineEdit()
-        self.clip_link_edit.setPlaceholderText("https://www.youtube.com/watch?v=...  — video của bạn hoặc video bạn có quyền dùng")
+        self.clip_link_edit.setPlaceholderText("https://www.youtube.com/watch?v=...  — link video nguồn")
         link_layout.addWidget(self.clip_link_edit)
         link_layout.addWidget(_hint("Có link: đến bước Cảnh & clip app dùng luôn video này. Để trống: ở bước đó app "
-                                    "tìm video Creative Commons theo chủ đề."))
+                                    "tìm video theo chủ đề."))
         vision_row = QHBoxLayout()
         vision_row.addWidget(_field("AI xem hình & chọn đoạn (bước 4)"))
         self.vision_combo = QComboBox()
@@ -984,6 +994,115 @@ class MainWindow(QMainWindow):
         # Above the tabs: it must be filled before pressing the tab's start button.
         source.body.insertWidget(0, self.clip_link_box)
         return _scroll(self._build_flow_banner(), kind, ai, source)
+
+    def _build_auto_box(self) -> QFrame:
+        """Auto mode: after the topic is chosen every step runs by itself up to the finished video."""
+        box = QFrame()
+        box.setObjectName("autoBox")
+        layout = QGridLayout(box)
+        layout.setContentsMargins(14, 10, 14, 12)
+        layout.setHorizontalSpacing(12)
+        layout.setVerticalSpacing(4)
+        self.auto_check = QCheckBox("Tự động chạy đến hết sau khi chọn chủ đề")
+        self.auto_check.setToolTip("Tự duyệt đề cương và kịch bản, tự chọn video nguồn (luồng clip) hoặc ảnh, rồi "
+                                   "render. Gặp lỗi thì dừng đúng bước đó; bấm lại bước đó để chạy tiếp.")
+        self.auto_template = QComboBox()
+        self.auto_resolution = QComboBox()
+        for value in catalog.RESOLUTIONS:
+            self.auto_resolution.addItem(value, value)
+        last = self._last_render_options()
+        self._fill_auto_templates(last.get("template"))
+        self.auto_resolution.setCurrentIndex(max(0, self.auto_resolution.findData(last.get("resolution"))))
+        self.type_cards.currentIndexChanged.connect(lambda _index: self._fill_auto_templates())
+        layout.addWidget(self.auto_check, 0, 0, 1, 3)
+        layout.addWidget(_field("Mẫu video"), 1, 0)
+        layout.addWidget(_field("Độ phân giải"), 1, 1)
+        layout.addWidget(self.auto_template, 2, 0)
+        layout.addWidget(self.auto_resolution, 2, 1)
+        layout.addWidget(_hint("Giọng đọc như ô ở trên. Chuyển cảnh, phụ đề, nhạc nền lấy theo lần render gần nhất."),
+                         3, 0, 1, 3)
+        layout.setColumnStretch(0, 3)
+        layout.setColumnStretch(1, 2)
+        layout.setColumnStretch(2, 2)
+        self.auto_check.toggled.connect(self._toggle_auto)
+        self._toggle_auto(False)
+        return box
+
+    def _fill_auto_templates(self, select: str | None = None) -> None:
+        select = select or self.auto_template.currentData()
+        self.auto_template.clear()
+        content_type = self.type_cards.currentData() or "kien_thuc"
+        for key, name in catalog.TEMPLATES_BY_TYPE.get(content_type, catalog.NEWS_TEMPLATES).items():
+            self.auto_template.addItem(name, key)
+        self.auto_template.setCurrentIndex(max(0, self.auto_template.findData(select)))
+
+    def _toggle_auto(self, on: bool) -> None:
+        for widget in (self.auto_template, self.auto_resolution):
+            widget.setEnabled(on)
+        if hasattr(self, "outline_button"):
+            self.outline_button.setText("Chạy tự động đến hết →" if on else "Tạo đề cương →")
+
+    @staticmethod
+    def _last_render_options() -> dict:
+        """Render choices of the newest video that was rendered (auto mode reuses the ones not asked in step 1)."""
+        for _directory, state in list_runs():
+            if state.get("render"):
+                return dict(state["render"])
+        return {}
+
+    def _arm_auto(self) -> None:
+        """Called where a video's steps start: auto mode follows the step 1 checkbox."""
+        self.auto_active = self.auto_check.isChecked()
+        self.auto_notes = []
+        if self.auto_active:
+            self._log("Tự động: chạy lần lượt các bước đến khi có video")
+
+    def _auto_next(self, step) -> None:
+        """Start the next step on its own in auto mode (after the current job has fully finished)."""
+        if self.auto_active:
+            QTimer.singleShot(0, step)
+
+    def auto_stop(self, reason: str) -> None:
+        """Auto mode cannot go on by itself: say why and leave the page to the user."""
+        if not self.auto_active:
+            return
+        self.auto_active = False
+        self._log(f"Tự động dừng: {reason}")
+        QMessageBox.information(self, "Chạy tự động đã dừng", reason)
+
+    def scene_notice(self, notes: list[str]) -> None:
+        """Scene warnings: a dialog when working by hand; in auto mode logged and shown once the video is done,
+        so a dialog does not hold up the steps."""
+        if not notes:
+            return
+        if self.auto_active:
+            self.auto_notes.extend(notes)
+            for note in notes:
+                self._log(f"Cần kiểm tra: {note}")
+            return
+        QMessageBox.warning(self, "Cần kiểm tra một số cảnh", "\n".join(notes))
+
+    def scenes_done(self) -> None:
+        """Every scene has its clip or picture: auto mode renders with the step 1 choices."""
+        if not self.auto_active:
+            return
+        missing = [str(index + 1) for index, scene in enumerate(self.state.get("scenes") or [])
+                   if not scene.get("clip") and not scene.get("image")]
+        if missing:
+            self.auto_stop(f"Các cảnh {', '.join(missing)} chưa có clip hoặc ảnh.")
+            return
+        options = {**self._last_render_options(), **(self.state.get("render") or {})}
+        options.update({"voice": self._voice(), "template": self.state.get("auto_template") or options.get("template"),
+                        "resolution": self.state.get("auto_resolution") or options.get("resolution")})
+        self.state["render"] = options
+        self._save()
+        self._log(f"Tự động: render ({options.get('template')}, {options.get('resolution')})")
+
+        def render() -> None:
+            self._to_render()
+            self._render()
+
+        QTimer.singleShot(0, render)
 
     def _show_input_tab(self, index: int) -> None:
         for position, page in enumerate(self.input_pages):
@@ -1026,6 +1145,8 @@ class MainWindow(QMainWindow):
             "duration": duration, "voice": self.script_voice_combo.currentData(),
             "style": self.style_combo.currentData(), "points": self.points_combo.currentData(),
             "scene_choice": self.scenes_combo.currentData(),
+            "auto": self.auto_check.isChecked(), "auto_template": self.auto_template.currentData(),
+            "auto_resolution": self.auto_resolution.currentData(),
         })
         return True
 
@@ -1094,12 +1215,16 @@ class MainWindow(QMainWindow):
         duration, voice = self.state["duration"], self._voice()
         self.state["outline"] = None
         self._save()
+        self._arm_auto()
 
         def done(fitted: dict) -> None:
             self._clear_outline()
             self._show_script(fitted)
             if then:
                 then()
+            if not self.state.get("scenes"):
+                # JSON with its own scenes went on to them in `then`; otherwise the scenes are split next.
+                self._auto_next(self._split_scenes)
 
         self._run("Đo thời lượng giọng đọc",
                   lambda progress: steps.fit_script_duration(None, "", "", script, duration, voice, progress), done)
@@ -1211,9 +1336,9 @@ class MainWindow(QMainWindow):
         self.topic_edit = QLineEdit()
         self.topic_edit.setPlaceholderText("Chủ đề video")
         card.body.addWidget(self.topic_edit)
-        next_button = _primary("Tạo đề cương →")
-        next_button.clicked.connect(self._make_outline)
-        card.body.addLayout(_buttons(next_button))
+        self.outline_button = _primary("Tạo đề cương →")
+        self.outline_button.clicked.connect(self._make_outline)
+        card.body.addLayout(_buttons(self.outline_button))
         return _scroll(card)
 
     def _show_topics(self, topics: list[dict]) -> None:
@@ -1247,7 +1372,11 @@ class MainWindow(QMainWindow):
             for key in ("outline", "script", "scenes", "video"):
                 self.state.pop(key, None)
         self.state["topic"] = topic
+        # Step 1 choices can be changed after going back; auto mode and its render choices follow them.
+        self.state.update({"auto": self.auto_check.isChecked(), "auto_template": self.auto_template.currentData(),
+                           "auto_resolution": self.auto_resolution.currentData()})
         self._save()
+        self._arm_auto()
         state = dict(self.state)
         self._run("AI đang lập đề cương...",
                   self._ai_job(lambda provider: steps.make_outline(
@@ -1362,6 +1491,7 @@ class MainWindow(QMainWindow):
         self._render_outline_view()
         self._clear_script()
         self._reset_from(SCRIPT)
+        self._auto_next(self._write_script)
 
     def _clear_outline(self) -> None:
         """Script used as given (verbatim content or JSON without an outline): no outline, no AI rewrite."""
@@ -1406,7 +1536,11 @@ class MainWindow(QMainWindow):
             return steps.fit_script_duration(provider, state["content_type"], state["category"], script,
                                              duration, voice, scaled_progress(progress, 40, 100), state.get("style"))
 
-        self._run("AI đang viết kịch bản và canh thời lượng...", self._ai_job(write_and_fit), self._show_script)
+        def done(script: dict) -> None:
+            self._show_script(script)
+            self._auto_next(self._split_scenes)
+
+        self._run("AI đang viết kịch bản và canh thời lượng...", self._ai_job(write_and_fit), done)
 
     def _clear_script(self) -> None:
         for widget in (self.script_title, self.script_hook, self.script_body):
@@ -1605,9 +1739,8 @@ class MainWindow(QMainWindow):
         self._save()
         self._reset_from(SCENES_PAGE)
         if self.kind == "clip":
-            if self.scene_warnings:
-                QMessageBox.warning(self, "Cần kiểm tra một số cảnh", "\n".join(self.scene_warnings))
-                self.scene_warnings = []
+            self.scene_notice(self.scene_warnings)
+            self.scene_warnings = []
             self.clip_page.scenes_ready()
             return
         self._refresh_scene_list()
@@ -1704,8 +1837,8 @@ class MainWindow(QMainWindow):
         self._save()
         self._refresh_scene_list(self.scene_list.currentRow())
         notes, self.scene_warnings = self.scene_warnings + errors, []
-        if notes:
-            QMessageBox.warning(self, "Cần kiểm tra một số cảnh", "\n".join(notes))
+        self.scene_notice(notes)
+        self.scenes_done()
 
     def _next_wikimedia(self) -> None:
         row = self.scene_list.currentRow()
@@ -1977,7 +2110,7 @@ class MainWindow(QMainWindow):
         texts.addStretch(1)
         self.open_folder = _button("Mở thư mục", icon="folder")
         self.copy_credits = _button("Copy ghi nguồn", icon="file")
-        self.copy_credits.setToolTip("Tên video nguồn, kênh, link và giấy phép, để dán vào caption khi đăng.")
+        self.copy_credits.setToolTip("Tên video nguồn, kênh và link để dán vào caption khi đăng.")
         self.copy_credits.clicked.connect(self._copy_credits)
         self.copy_credits.setVisible(False)
         self.export_button = _button("Xuất video", "soft", "folder", "#1d4ed8")
@@ -2015,7 +2148,7 @@ class MainWindow(QMainWindow):
         grid.setVerticalSpacing(6)
         self.spec_values = {}
         for row, key in enumerate(("Độ phân giải", "Tỷ lệ khung hình", "Giọng đọc", "Thời lượng", "Chuyển cảnh",
-                                   "Nhịp ảnh", "Phụ đề", "Số cảnh", "Nguồn ảnh", "Định dạng", "Dung lượng")):
+                                   "Nhịp ảnh", "Phụ đề", "Số cảnh", "Định dạng", "Dung lượng")):
             value = label("", "specValue", wrap=True)
             value.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
             grid.addWidget(label(key, "specKey"), row, 0)
@@ -2039,7 +2172,6 @@ class MainWindow(QMainWindow):
             "Nhịp ảnh": self.timing_combo.currentText(),
             "Phụ đề": self.subtitle_combo.currentText(),
             "Số cảnh": str(len(scenes)),
-            "Nguồn ảnh": _source_label(scenes) if scenes else "",
             "Định dạng": "MP4 (H.264 / AAC)",
             "Dung lượng": f"{video.stat().st_size / 1024 / 1024:.1f} MB" if video and video.is_file() else "sau khi render",
         }
@@ -2169,6 +2301,12 @@ class MainWindow(QMainWindow):
             self._update_specs()
             self._update_storage()
             self._scroll_to(self.done_bar)
+            if self.auto_active:
+                self.auto_active = False
+                notes, self.auto_notes = self.auto_notes, []
+                self._log("Tự động: xong video")
+                text = "Video đã xong." + ("\n\nCần kiểm tra:\n- " + "\n- ".join(notes) if notes else "")
+                QMessageBox.information(self, "Chạy tự động xong", text)
 
         self.render_panel.setVisible(True)
         self.render_panel.start()
@@ -2180,6 +2318,7 @@ class MainWindow(QMainWindow):
         if not self.render_active:
             return
         self.render_cancelling = True
+        self.auto_active = False
         if "id" not in self.render_thread:
             # The worker has not started yet; try again once it has recorded its thread.
             QTimer.singleShot(200, self._cancel_render)

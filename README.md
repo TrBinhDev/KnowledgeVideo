@@ -19,6 +19,13 @@
 
 Mọi bước AI đều có duyệt/sửa: **AI có thể viết sai năm tháng, tên người, sự kiện — luôn kiểm tra kịch bản trước khi render.**
 
+### Chạy tự động
+
+Ở bước 1 tích **Tự động chạy đến hết sau khi chọn chủ đề** và chọn **mẫu video**, **độ phân giải** (giọng đọc là ô ở trên; chuyển cảnh, phụ đề, nhạc nền lấy theo lần render gần nhất). Chọn chủ đề ở bước 2 rồi bấm **Chạy tự động đến hết**: app tự duyệt đề cương và kịch bản, chia cảnh, lấy ảnh (luồng ảnh) hoặc chọn video nguồn (luồng clip), rồi render. Cũng áp dụng khi bắt đầu từ nội dung có sẵn hoặc kịch bản JSON.
+
+- Luồng clip không có link: tìm bằng từ khóa AI gợi ý, AI chấm mỗi video **0–10 theo độ hợp chủ đề** (cùng lần xem storyboard), tự chọn video đúng loại, dài không quá 30 phút, điểm cao nhất. Điểm cao nhất dưới **6** thì tìm lại bằng từ khóa tiếng Anh; vẫn thấp thì dừng để bạn chọn. Video nguồn ghép được ít cảnh (quá nửa) thì thử video điểm cao kế tiếp một lần.
+- Cảnh báo về cảnh được ghi vào Nhật ký và hiện một lần khi video xong. Gặp lỗi thì dừng đúng bước đó; bấm lại bước đó để chạy tiếp. **Hủy** thì dừng hẳn chế độ tự động.
+
 ## Luồng video clip ("Tạo video clip")
 
 Bước 1–3 giống luồng ảnh. Bước 4 **Cảnh & clip** dùng các shot của **một video nguồn** cho cả video (màu và chất hình đồng đều):
@@ -26,12 +33,12 @@ Bước 1–3 giống luồng ảnh. Bước 4 **Cảnh & clip** dùng các shot
 - Bước 1 của luồng clip có dải màu cam nhận diện và ô **Link video nguồn (tùy chọn)**: có link thì bước 4 dùng luôn video đó.
 - **AI xem hình & chọn đoạn** (ô ở bước 1 và bước 4, dùng chung): *Như AI viết nội dung*, *Gemini*, *Gemini qua cổng API* hoặc *Ollama* (`KV_VISION_MODEL`, mặc định `gemma3`). Gemini nhận ảnh storyboard/lưới shot để phân loại và mô tả — nhanh và đúng hơn gemma3 nhưng tốn token (ghi trong Nhật ký).
 - Các việc dài ở bước 4 (tìm video, chuẩn bị video nguồn, ghép lại) có nút **Hủy** trên thanh trạng thái: trang mở khóa ngay, việc đang chạy dừng ở nền.
-- **Chọn video nguồn**: tìm video YouTube **Creative Commons** (được phép dùng lại, phải ghi nguồn) theo từ khóa chủ đề, hoặc **dán link YouTube** video bạn có quyền dùng.
-  - Khi tìm, app lấy storyboard (ảnh lưới nhỏ, không tải video) và dùng model xem ảnh của Ollama (`gemma3`) phân loại: quay thật, tư liệu cũ, hoạt hình/3D, tranh vẽ, slide, người dẫn. Bộ lọc *Chỉ tư liệu thật* hoặc *Cho phép hoạt hình*.
+- **Chọn video nguồn**: tìm video YouTube theo từ khóa chủ đề hoặc **dán link YouTube** video nguồn.
+  - Khi tìm, app lấy storyboard (ảnh lưới nhỏ, không tải video) và dùng model xem ảnh phân loại: quay thật, tư liệu cũ, hoạt hình/3D, tranh vẽ, slide, người dẫn, kèm **điểm hợp chủ đề 0–10** (danh sách xếp theo điểm). Bộ lọc *Chỉ tư liệu thật* hoặc *Cho phép hoạt hình*.
 - App tải bản **360p** của video nguồn để phân tích: tách shot (FFmpeg), AI mô tả từng shot, AI chọn **shot bắt đầu** hợp với lời đọc của từng cảnh. Mỗi cảnh là **một đoạn liền** của video nguồn, chạy từ shot đó đủ số giây của cảnh; các đoạn không chồng nhau (trùng thì dời sang đoạn trống gần nhất; video nguồn không đủ dài thì cảnh đó dùng ảnh thay). Từng cảnh có thể **chọn điểm bắt đầu khác** hoặc **dùng ảnh thay**.
 - **Logo/watermark**: tự dò vùng chữ/logo đứng yên suốt video; khung dọc 9:16 được đặt tránh logo, logo còn trong khung thì làm mờ. Có thể **khoanh vùng logo** bằng tay hoặc chọn *Không có logo*.
 - Khi render: chỉ tải **đúng đoạn** của từng cảnh ở chất lượng cao (tối đa 1080p), cắt 9:16, bỏ tiếng gốc (chỉ có giọng đọc theo kịch bản). Render xong thì xóa bản 360p.
-- **Ghi nguồn**: tên video nguồn, kênh, link, giấy phép được ghi lên video và vào `render/credits.txt`; nút **Copy ghi nguồn** để dán vào caption khi đăng.
+- **Ghi nguồn**: tên video nguồn, kênh và link được lưu vào `render/credits.txt`; nút **Copy ghi nguồn** để dán vào caption khi đăng.
 
 Bản 360p nằm trong `output/_clip_cache/` (giới hạn dung lượng chỉnh trong Cài đặt, tự xóa file cũ nhất; có nút dọn cache).
 
@@ -46,7 +53,7 @@ Bản 360p nằm trong `output/_clip_cache/` (giới hạn dung lượng chỉnh
 
 Không cần API key cho các nguồn trên. Nút "Ảnh AI (Gemini)" chỉ dùng được với API key có bật billing.
 
-> Ảnh Commons/Wikipedia/Openverse có giấy phép riêng (thường là CC BY-SA). Thông tin tác giả và giấy phép của từng ảnh được lưu trong `state.json`; khi đăng video công khai cần ghi công theo đúng giấy phép. Ảnh AI chỉ là minh họa, không phải tư liệu lịch sử thật.
+> Video không chèn dòng nguồn ảnh lên khung hình. Ảnh Commons/Wikipedia/Openverse có giấy phép riêng; thông tin tác giả và giấy phép vẫn được lưu trong `state.json` để tra lại khi cần. Ảnh AI chỉ là minh họa, không phải tư liệu lịch sử thật.
 
 ## Template lịch sử
 
@@ -136,7 +143,7 @@ core/render.py       Chuẩn bị dữ liệu render
 core/preview.py      Ảnh mẫu template và clip xem trước chuyển cảnh (dùng chung bộ lọc với render)
 core/samples.py      Ảnh minh họa tự vẽ cho trang Mẫu video khi chưa có video nào
 core/sources.py      Đọc tài liệu txt/docx/pdf, tách nội dung nguyên văn thành tiêu đề/hook/thân bài
-core/clips.py        Luồng video clip: tìm video CC, phân loại, tách shot, dò logo, ghép shot, cắt clip 9:16
+core/clips.py        Luồng video clip: tìm video nguồn, phân loại, tách shot, dò logo, ghép shot, cắt clip 9:16
 ui/clip_page.py      Bước "Cảnh & clip"
 assets/templates/    Khung SVG cho template tin tức
 ```
@@ -147,4 +154,4 @@ assets/templates/    Khung SVG cho template tin tức
 - Tìm ảnh tự động vẫn có cảnh ra ảnh lệch nội dung, nhất là chủ đề trừu tượng; nên xem lại từng cảnh.
 - "Theo câu đọc" ước lượng điểm đổi ảnh theo độ dài chữ của từng cảnh trên mốc thời gian từng câu; ranh giới cảnh nằm giữa câu có thể lệch vài trăm mili giây.
 - PDF dạng ảnh scan không đọc được (cần OCR).
-- Video clip: `gemma3` phân loại video và nhận ra logo chưa chắc chắn (thử 8 tấm storyboard: đúng 6); mô tả shot có thể đọc sai chữ trên hình. Video Creative Commons về lịch sử Việt Nam phần lớn là slide/tranh vẽ/3D, ít cảnh quay thật. Một số kênh gắn nhãn CC cho video không phải của họ — app không kiểm tra được.
+- Video clip: `gemma3` phân loại video và nhận ra logo chưa chắc chắn (thử 8 tấm storyboard: đúng 6); mô tả shot có thể đọc sai chữ trên hình. Video nguồn về lịch sử Việt Nam thường có nhiều slide/tranh vẽ/3D, ít cảnh quay thật.

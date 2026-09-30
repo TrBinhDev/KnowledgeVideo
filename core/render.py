@@ -25,21 +25,6 @@ def _content_label(state: dict) -> str:
         return "Kiến thức lịch sử"
 
 
-def _source_label(scenes: list[dict]) -> str:
-    sources = {(scene.get("image") or {}).get("source") for scene in scenes if not scene.get("clip")}
-    labels = ["video YouTube"] if any(scene.get("clip") for scene in scenes) else []
-    if sources & {"wikipedia", "wikipedia_topic"}:
-        labels.append("Wikipedia")
-    if "wikimedia" in sources:
-        labels.append("Wikimedia Commons")
-    if "openverse" in sources:
-        labels.append("Openverse")
-    if sources & {"ai", "pollinations"}:
-        labels.append("minh họa AI")
-    # The pipeline prefixes this with "Nguồn: ".
-    return ", ".join(labels) if labels else "Kiến thức lịch sử"
-
-
 def import_music(store: RunStore, source: str) -> str:
     """Copy the chosen music file into the run folder so the snapshot is self-contained."""
     if not source:
@@ -64,11 +49,6 @@ def build_snapshot(state: dict, render_options: dict, music_file: str, tts_rate:
     if missing:
         raise RuntimeError(f"Các cảnh chưa có ảnh hoặc clip: {', '.join(map(str, missing))}.")
     script = state["script"]
-    source_name = _source_label(scenes)
-    clip_source = state.get("clip_source") or {}
-    if clip_source.get("channel") and any(scene.get("clip") for scene in scenes):
-        # On-screen credit for the source video (CC BY needs the author named).
-        source_name = source_name.replace("video YouTube", f"{clip_source['channel']} (YouTube)")
     return {
         "script": {"title": script["title"], "hook": script["hook"], "body": script["body"], "revision": 1},
         "voice": render_options["voice"],
@@ -83,11 +63,9 @@ def build_snapshot(state: dict, render_options: dict, music_file: str, tts_rate:
         "scene_texts": [scene["text"] for scene in scenes],
         "music_file": music_file,
         "music_volume": render_options["music_volume"],
-        "source_name": source_name,
         "title_badge": _year_badge(script["title"], state.get("topic", "")),
         "title_label": _content_label(state),
-        # No "Nguồn: ..." line on the video: the credits go in the post caption (credits.txt, "Copy ghi nguồn").
-        "template_options": {"show_source": False, "show_title_card": True, "title_position": "top"},
+        "template_options": {"show_title_card": True, "title_position": "top"},
     }
 
 

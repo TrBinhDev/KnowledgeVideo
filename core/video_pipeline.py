@@ -625,6 +625,7 @@ async def synthesize(text, voice, directory, rate="+0%", word_cues: list | None 
 
 def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
     directory.mkdir(parents=True, exist_ok=True)
+    (directory / "source.txt").unlink(missing_ok=True)
     validate_runtime(storage, directory)
     stage("prepare_content", 5)
     script = snapshot["script"]
@@ -796,8 +797,6 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
     for line_index, line in enumerate(title_lines):
         (directory / f"title_{line_index}.txt").write_text(line, encoding="utf-8", newline="\n")
     (directory / "title_dots.txt").write_text("●  ●  ●", encoding="utf-8", newline="\n")
-    source_name = str(snapshot.get("source_name") or snapshot.get("source_id") or "Nguồn tổng hợp").strip()
-    (directory / "source.txt").write_text(f"Nguồn: {source_name}", encoding="utf-8", newline="\n")
     stage("template_composition", 60)
     font = Path(os.environ.get("KV_VIDEO_FONT") or "C:/Windows/Fonts/arial.ttf")
     if template_options.get("font_file"):
@@ -813,7 +812,6 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
     video_mode = snapshot.get("video_mode", "single_image")
     if video_mode not in ("single_image", "news_report", "breaking_news"):
         raise RuntimeError("Chế độ video không hợp lệ.")
-    show_source = bool(template_options.get("show_source", True))
     show_title_card = bool(template_options.get("show_title_card", True)) and video_mode != "breaking_news"
     if not show_title_card:
         banner_end = 0.0
@@ -837,52 +835,48 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
     if history_card:
         artwork_path, artwork_height = template_artwork
         banner_y, banner_height = 0, height
-        banner_fill, title_color, source_color = "", "white", "white"
+        banner_fill, title_color = "", "white"
         accent = brand_color
         title_size = 0
     elif browser_card:
         banner_y, banner_height = int(height * 0.56), int(height * 0.40)
         card_y, card_height = int(height * 0.59), int(height * 0.25)
-        banner_fill, title_color, source_color = "0xF8D58A", "0x111827", "white"
+        banner_fill, title_color = "0xF8D58A", "0x111827"
         accent = brand_color
         title_size = max(40, min(60, width // 20))
     elif template_artwork:
         artwork_path, artwork_height = template_artwork
         banner_y, banner_height = max(int(height * 0.50), height - artwork_height - int(height * 0.06)), artwork_height
         banner_fill, title_color = "", "white"
-        source_color = "#0b0d10" if template == "banner-yellow" else "white"
         accent = brand_color
         title_size = max(32, min(46, width // 23))
     elif template == "review":
         banner_y, banner_height = int(height * 0.47), int(height * 0.24)
-        banner_fill, title_color, source_color = "0xFFFFFF@0.94", "0x111827", "0x334155"
+        banner_fill, title_color = "0xFFFFFF@0.94", "0x111827"
         accent = brand_color
         title_size = max(34, width // 23)
     elif template == "minimal":
         banner_y, banner_height = int(height * 0.10), int(height * 0.19)
-        banner_fill, title_color, source_color = "0x111827@0.88", "white", "0xCBD5E1"
+        banner_fill, title_color = "0x111827@0.88", "white"
         accent = brand_color
         title_size = max(34, width // 22)
     elif template == "news-overview":
         banner_y, banner_height = int(height * 0.10), int(height * 0.23)
-        banner_fill, title_color, source_color = "0x062B50@0.94", "white", "0xDBEAFE"
+        banner_fill, title_color = "0x062B50@0.94", "white"
         accent = brand_color
         title_size = max(34, width // 22)
     else:
         banner_y, banner_height = int(height * 0.08), int(height * 0.23)
-        banner_fill, title_color, source_color = "0x0B1F3A@0.92", "white", "0xDBEAFE"
+        banner_fill, title_color = "0x0B1F3A@0.92", "white"
         accent = brand_color
         title_size = max(34, width // 22)
     banner_end_expr = f"{banner_end:.3f}"
     if history_card:
-        source_y, title_y = 36, 0
+        title_y = 0
     elif browser_card:
-        source_y = 36
         title_y = card_y + int(card_height * 0.34)
-        source_x = 36
     elif template_artwork:
         artwork_scale = width / 1200
-        source_y = f"{banner_y + 153 * artwork_scale:.3f}-text_h/2"
         safe_top = banner_y + round(236 * artwork_scale)
         safe_bottom = banner_y + round(468 * artwork_scale)
         title_content_top = safe_top + round(18 * artwork_scale)
@@ -894,13 +888,11 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
             "bottom": f"{title_content_bottom}-text_h",
         }[title_position]
     else:
-        source_y = banner_y + int(banner_height * 0.12)
         title_y = {
             "top": banner_y + int(banner_height * 0.30),
             "center": banner_y + int(banner_height * 0.42),
             "bottom": banner_y + int(banner_height * 0.54),
         }[title_position]
-    source_x = "0.330*w-text_w/2" if template_artwork and not history_card else 36
     transitions = transition_names(template, snapshot.get("transition", "template"), max(0, len(asset_entries) - 1))
     overlap = transition_seconds(min(lengths), transitions)
 
@@ -1018,12 +1010,6 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
         f"subtitles={subtitle_file}:original_size={width}x{height}:force_style='{subtitle_style}'"
         if subtitle_file else "null"
     )
-    source_overlay = ""
-    if show_source:
-        source_overlay = (
-            f"drawtext=fontfile=font.ttf:textfile=source.txt:expansion=none:fontcolor={source_color}:"
-            f"fontsize={max(22, width // 42)}:x={source_x}:y={source_y}:borderw=2:bordercolor=0x000000@0.55,"
-        )
     title_overlay = ""
     if show_title_card and not history_card:
         line_height = round(title_size * 1.17) + (-8 if template_artwork else 2)
@@ -1048,13 +1034,13 @@ def render(snapshot, directory: Path, storage: Path, stage, tts=synthesize):
                 f"shadowx=1:shadowy=1:shadowcolor={'0x700000@0.55' if template_artwork else '0x000000@0.55'}:"
                 f"enable='lt(t,{banner_end_expr})',"
             )
-    text_filter = source_overlay + title_overlay + subtitle_filter
+    text_filter = title_overlay + subtitle_filter
     if browser_card or not template_artwork:
         video_filter += text_filter
         scene_filters.append(video_filter + "[vtext]")
     else:
         scene_filters.append(
-            composition_label + source_overlay + title_overlay
+            composition_label + title_overlay
             + f"{subtitle_filter}[vtext]"
         )
     filter_complex = []

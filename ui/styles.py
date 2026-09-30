@@ -89,6 +89,7 @@ QLabel#flowTitle { font-weight: 700; font-size: 10.5pt; color: #1d4ed8; }
 QLabel#flowTitle[kind="clip"] { color: #c2410c; }
 QLabel#flowText { color: #475569; font-size: 8.5pt; }
 QFrame#clipLinkBox { background: #fff7ed; border: 1px dashed #fdba74; border-radius: 10px; }
+QFrame#autoBox { background: #f0fdf4; border: 1px solid #bbf7d0; border-radius: 10px; }
 
 /* call to action bars */
 QFrame#ctaBar { background: #f5f8ff; border: 1px solid #d6e2ff; border-radius: 12px; }

@@ -1,6 +1,6 @@
 """Video clips as scene footage for the "Tạo video clip" flow.
 
-One source video per run: found by keyword among Creative Commons YouTube videos, or pasted by the user. It is
+One source video per run: found on YouTube by keyword, or pasted by the user. It is
 downloaded once at 360p to split into shots and look at them; only the shots picked for the scenes are fetched in
 high quality at render time, cut to 9:16, with channel logos kept out of the frame or blurred.
 """
@@ -27,7 +27,6 @@ from core.video_pipeline import RenderCancelled, check_cancelled, probe, run_med
 
 logger = logging.getLogger("kv.clips")
 
-# YouTube search filter "Creative Commons" (sp=EgIwAQ==): only videos whose owner allows reuse with credit.
 _YOUTUBE_ID = re.compile(r"^[A-Za-z0-9_-]{11}$")
 _YOUTUBE_HOSTS = {"youtube.com", "www.youtube.com", "m.youtube.com", "youtu.be"}
 # Titles that say the video is animated, AI-made or a slide deck (checked before spending time on a video).
@@ -36,6 +35,7 @@ _UNREAL_WORDS = ("hoạt hình", "animation", "animated", "cartoon", "3d", "sora
 KIND_LABELS = {
     "live_footage": "Quay thật",
     "archival_footage": "Tư liệu cũ",
+    "ai_generated": "Dựng bằng AI",
     "animation_3d": "Hoạt hình / 3D",
     "illustration": "Tranh vẽ (slideshow)",
     "slides": "Slide / chữ",
@@ -43,7 +43,8 @@ KIND_LABELS = {
 }
 CONTENT_FILTERS = {
     "real": ("Chỉ tư liệu thật", {"live_footage", "archival_footage"}),
-    "any": ("Cho phép hoạt hình", {"live_footage", "archival_footage", "animation_3d"}),
+    # AI-made reenactments count as animation: allowed only when animation is.
+    "any": ("Cho phép hoạt hình", {"live_footage", "archival_footage", "animation_3d", "ai_generated"}),
 }
 MIN_SHOT_SECONDS = 1.5
 MAX_SHOT_SECONDS = 8.0
@@ -210,17 +211,12 @@ def video_info(video_id: str) -> dict:
 def _source_fields(info: dict) -> dict:
     return {"id": info["id"], "url": watch_url(info["id"]), "title": info.get("title") or "",
             "channel": info.get("channel") or info.get("uploader") or "",
-            "license": info.get("license") or "", "duration": float(info.get("duration") or 0)}
-
-
-def is_creative_commons(license_text: str) -> bool:
-    return "creative commons" in (license_text or "").casefold()
+            "duration": float(info.get("duration") or 0)}
 
 
 def credit_line(source: dict) -> str:
-    license_text = "CC BY" if is_creative_commons(source.get("license", "")) else ""
     parts = [f"\"{source.get('title', '')}\" - {source.get('channel', '')}".strip(" -"), source.get("url", "")]
-    return "\n".join(part for part in parts if part) + (f" ({license_text})" if license_text else "")
+    return "\n".join(part for part in parts if part)
 
 
 # ---------- looking at a video: storyboard sheets and the local vision model ----------
@@ -284,18 +280,31 @@ def ollama_vision(prompt: str, image_paths: list[Path], schema: dict) -> dict:
 
 
 _CLASSIFY_PROMPT = (
-    "This image is a grid of thumbnails sampled from one YouTube video. Classify the video.\n"
+    "This image is a grid of thumbnails sampled from one YouTube video titled: {title}\n"
+    "Classify the video.\n"
     "kind: one of live_footage (real camera footage, modern), archival_footage (old real film), "
+    "ai_generated (photorealistic video made by AI: glossy cinematic look, uniform dramatic lighting, very clean "
+    "costumes and crowds, every frame looks like concept art or a movie still; historical reenactments of "
+    "ancient battles with this look are usually AI), "
     "slides (presentation slides or text screens), illustration (drawn or painted images, slideshow), "
     "animation_3d (3D or cartoon animation), talking_head (a presenter talking to camera).\n"
     "watermark: true if a channel logo or station name is burned into the corner of the frames.\n"
+    "score: 0-10, how well this video could illustrate a short video about: {about}\n"
+    "Judge the title and the frames together. 10 = clearly this exact subject; 5 = same era or theme but not this "
+    "subject; 0 = unrelated. If the title names a different event, year, battle or person than the subject (for "
+    "example another battle at the same place in another year), score at most 3 even if the frames look similar.\n"
     "Answer JSON only."
 )
 _CLASSIFY_SCHEMA = {
     "type": "object",
-    "properties": {"kind": {"type": "string", "enum": list(KIND_LABELS)}, "watermark": {"type": "boolean"}},
-    "required": ["kind", "watermark"],
+    "properties": {"kind": {"type": "string", "enum": list(KIND_LABELS)}, "watermark": {"type": "boolean"},
+                   "score": {"type": "integer"}},
+    "required": ["kind", "watermark", "score"],
 }
+# A source video scoring below this is not picked automatically (auto mode searches again, then asks the user).
+GOOD_SCORE = 6
+# Auto mode skips longer sources: the whole video is downloaded at 360p for the shot split.
+AUTO_MAX_SOURCE_SECONDS = 30 * 60
 
 
 def storyboard_sheet(info: dict, directory: Path) -> Path | None:
@@ -324,17 +333,33 @@ def storyboard_sheet(info: dict, directory: Path) -> Path | None:
     return sheet
 
 
-def classify(sheet: Path, vision=ollama_vision) -> tuple[str, bool]:
-    data = vision(_CLASSIFY_PROMPT, [sheet], _CLASSIFY_SCHEMA)
+def classify(sheet: Path, vision=ollama_vision, about: str = "", title: str = "") -> tuple[str, bool, int]:
+    """Kind of video, burned-in logo, and a 0-10 score of how well it fits `about` (the video being made).
+
+    The title goes along with the frames: battles, costumes and landscapes look alike across centuries, while the
+    title tells which event the video is about."""
+    prompt = _CLASSIFY_PROMPT.replace("{about}", about or "the search keywords").replace("{title}", title or "(unknown)")
+    data = vision(prompt, [sheet], _CLASSIFY_SCHEMA)
     kind = data.get("kind") if data.get("kind") in KIND_LABELS else "slides"
-    return kind, bool(data.get("watermark"))
+    score = data.get("score")
+    score = max(0, min(10, score)) if isinstance(score, int) and not isinstance(score, bool) else 0
+    return kind, bool(data.get("watermark")), score
 
 
-def find_candidates(query: str, content_filter: str, progress=None, limit: int = 8, vision=ollama_vision) -> list[dict]:
-    """Creative Commons videos for the topic, each looked at through its storyboard and classified.
+def best_candidate(candidates: list[dict], skip: set[str] = frozenset()) -> dict | None:
+    """Auto mode's pick: an allowed kind, not too long, highest score (None when nothing is usable)."""
+    usable = [item for item in candidates if item.get("allowed") and item["id"] not in skip
+              and item["duration"] <= AUTO_MAX_SOURCE_SECONDS]
+    return max(usable, key=lambda item: item.get("score", 0), default=None)
 
-    Videos whose kind is allowed by `content_filter` come first. Logos do not exclude a video: they are cropped
-    out or blurred when the scenes are cut.
+
+def find_candidates(query: str, content_filter: str, progress=None, limit: int = 8, vision=ollama_vision,
+                    about: str = "") -> list[dict]:
+    """YouTube videos for the query, each looked at through its storyboard: classified and scored against
+    `about` (title and topic of the video being made).
+
+    Videos whose kind is allowed by `content_filter` come first, best score first. Logos do not exclude a video:
+    they are cropped out or blurred when the scenes are cut.
     """
     allowed = CONTENT_FILTERS[content_filter][1]
     found = search(query)
@@ -349,7 +374,7 @@ def find_candidates(query: str, content_filter: str, progress=None, limit: int =
         try:
             info = video_info(item["id"])
             sheet = storyboard_sheet(info, boards)
-            kind, watermark = classify(sheet, vision) if sheet else ("slides", False)
+            kind, watermark, score = classify(sheet, vision, about, item["title"]) if sheet else ("slides", False, 0)
         except ClipError as error:
             logger.info("clip_candidate_skipped id=%s reason=%s", item["id"], error)
             return None
@@ -363,14 +388,16 @@ def find_candidates(query: str, content_filter: str, progress=None, limit: int =
             if progress:
                 progress(f"Đã xem thử {len(looked)}/{len(found)} video: {item['title'][:50]}",
                          round(100 * len(looked) / max(1, len(found))))
-        return {**_source_fields(info), "kind": kind, "watermark": watermark,
+        return {**_source_fields(info), "kind": kind, "watermark": watermark, "score": score,
                 "allowed": kind in allowed, "board": str(sheet) if sheet else ""}
 
     if progress:
         progress(f"Xem thử {len(found)} video", 0)
     # Reading a video's page and its storyboard is mostly waiting on YouTube, so several are looked at at once.
     candidates = [item for item in run_parallel(look_at, found, CANDIDATE_WORKERS) if item]
-    candidates.sort(key=lambda item: not item["allowed"])
+    candidates.sort(key=lambda item: (not item["allowed"], -item["score"]))
+    logger.info("clip_candidates query=%s | %s", query[:80],
+                ", ".join(f"{item['id']} {item['score']}/10{'' if item['allowed'] else ' (loại)'}" for item in candidates))
     return candidates
 
 
@@ -641,6 +668,10 @@ _ASSIGN_SCHEMA = {
 }
 
 
+# Auto mode reads this warning as "the source fits badly" and tries the next best source video.
+WEAK_MATCH_WARNING = "AI không ghép được phần lớn cảnh; đã xếp shot theo thứ tự video — nên kiểm tra từng cảnh."
+
+
 def assign_shots(provider: BaseAIProvider, scenes: list[dict], shots: list[dict], total_seconds: float) -> tuple[list[int | None], list[str]]:
     """Shot index for each scene (None = no shot fits, the scene uses a picture); plus warnings for the user.
 
@@ -681,7 +712,7 @@ Schema: {"assignments": [{"scene": 1, "shot": 12}]}"""
     ai_chose = len(used)
     # A small model sometimes answers "no fit" for most scenes; footage in story order is then better than pictures.
     if len(said_none) > len(scenes) // 2:
-        warnings.append("AI không ghép được phần lớn cảnh; đã xếp shot theo thứ tự video — nên kiểm tra từng cảnh.")
+        warnings.append(WEAK_MATCH_WARNING)
         said_none = set()
     for index in range(len(scenes)):
         if chosen[index] is not None or index in said_none:
