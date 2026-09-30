@@ -1,0 +1,25 @@
+{
+  "name": "knowledgevideo-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "main": "electron/main.cjs",
+  "scripts": {
+    "dev": "node electron/dev.cjs",
+    "dev:web": "next dev",
+    "build": "next build",
+    "start": "node electron/start.cjs",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "next": "16.3.6",
+    "react": "19.3.0",
+    "react-dom": "19.3.0"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0",
+    "electron": "44.4.5",
+    "typescript": "^5.9.0"
+  }
+}
