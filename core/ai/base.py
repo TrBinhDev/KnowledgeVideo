@@ -1,4 +1,5 @@
 import json
+import logging
 from abc import ABC, abstractmethod
 
 
@@ -41,7 +42,17 @@ def parse_json_text(content: str, provider: str) -> dict:
     try:
         data = json.loads(text)
     except json.JSONDecodeError as error:
-        raise ProviderResponseError(f"Phản hồi từ {provider} không phải JSON hợp lệ.") from error
+        # The gateway sometimes returns a complete JSON object followed by extra text (often the object again):
+        # json.loads fails with "Extra data". Keep the first complete object.
+        start = text.find("{")
+        try:
+            data, end = json.JSONDecoder().raw_decode(text[start:]) if start >= 0 else (None, 0)
+        except json.JSONDecodeError:
+            data = None
+        if data is None:
+            raise ProviderResponseError(f"Phản hồi từ {provider} không phải JSON hợp lệ.") from error
+        logging.getLogger("kv.ai").warning("json_extra_text_ignored provider=%s kept=%d of %d chars",
+                                           provider, end, len(text) - start)
     if not isinstance(data, dict):
         raise ProviderResponseError(f"Phản hồi từ {provider} phải là một đối tượng JSON.")
     return data

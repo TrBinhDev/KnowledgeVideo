@@ -482,6 +482,20 @@ def execute(request: dict) -> None:
     send(response)
 
 
+def _warm_qt_enums() -> None:
+    """PySide6 creates enum attributes on first access, and two worker threads touching one for the first time
+    together failed ("QFont has no attribute 'Bold'") or crashed. Touch the ones core/ uses, on the main thread."""
+    from PySide6.QtCore import Qt
+    from PySide6.QtGui import QFont, QImage, QPainter
+    for owner, names in ((QFont, ("Bold", "AbsoluteSpacing")),
+                         (QImage, ("Format_RGB32", "Format_RGB888", "Format_ARGB32_Premultiplied")),
+                         (QPainter, ("Antialiasing", "TextAntialiasing", "RenderHint")),
+                         (Qt, ("AlignCenter", "AlignHCenter", "AlignLeft", "AlignRight", "AlignTop", "AlignVCenter",
+                               "DashLine", "GlobalColor", "NoBrush", "NoPen", "TextWordWrap"))):
+        for name in names:
+            getattr(owner, name)
+
+
 def main() -> None:
     global _job_thread
     # Qt painting with fonts (clip grids for the vision AI, title cards) aborts the whole process when no
@@ -489,6 +503,7 @@ def main() -> None:
     # QT_QPA_PLATFORM=offscreen, so no window is created.
     from PySide6.QtGui import QGuiApplication
     qt_application = QGuiApplication.instance() or QGuiApplication([])  # noqa: F841 (must stay alive)
+    _warm_qt_enums()
     # Requests come on stdin, and this loop always has a read pending there. On Windows a child that inherits
     # the same pipe (ffmpeg checks it for key presses) then hangs forever: the final "-f null" check of every
     # render never returned. Read requests from a private copy and give fd 0 (inherited by ffmpeg, ffprobe,

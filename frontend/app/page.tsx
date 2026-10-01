@@ -1,7 +1,7 @@
 "use client";
 
 import * as RadixSelect from "@radix-ui/react-select";
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 type Data = Record<string, any>;
 type Kind = "image" | "clip";
@@ -84,6 +84,20 @@ function Card({ title, description, children, className = "" }: { title?: string
   return <section className={`panel ${className}`}>{title && <div className="panel-heading"><h2>{title}</h2>{description && <p>{description}</p>}</div>}{children}</section>;
 }
 
+type LogKind = "start" | "progress" | "done" | "warn" | "error";
+interface LogEntry { id: number; time: Date; kind: LogKind; text: string; percent: number }
+const logLabels: Record<LogKind, string> = { start: "Bắt đầu", progress: "Đang làm", done: "Xong", warn: "Cảnh báo", error: "Lỗi" };
+const formatSeconds = (seconds: number) => seconds < 60 ? `${seconds.toFixed(seconds < 10 ? 1 : 0)} giây` : `${Math.floor(seconds / 60)} phút ${Math.round(seconds % 60)} giây`;
+const clock = (time: Date) => time.toLocaleTimeString("vi-VN", { hour12: false });
+/** Electron wraps bridge errors as "Error invoking remote method 'kv:call': Error: <message>"; keep the message. */
+function readableError(error: unknown): string {
+  const raw = error instanceof Error ? error.message : String(error);
+  const text = raw.replace(/^Error invoking remote method '[^']+':\s*/, "").replace(/^Error:\s*/, "");
+  const crashed = text.match(/Python backend stopped \(([^)]*)\)/);
+  if (crashed) return `Phần xử lý Python bị dừng đột ngột (mã ${crashed[1]}). Tác vụ vừa rồi không hoàn tất; bấm lại để chạy tiếp, backend sẽ tự khởi động lại.`;
+  return text;
+}
+
 const templateNotes: Data = {
   "history-scroll": ["CỔ THƯ", "Nền giấy, dấu son và màu sepia", "scroll"],
   "history-imperial": ["HOÀNG TRIỀU", "Đỏ son và điểm nhấn vàng kim", "imperial"],
@@ -129,6 +143,11 @@ export default function Home() {
   const [status, setStatus] = useState("");
   const [percent, setPercent] = useState(-1);
   const [notice, setNotice] = useState("");
+  const [failure, setFailure] = useState<{ title: string; text: string } | null>(null);
+  const [logs, setLogs] = useState<LogEntry[]>([]);
+  const [logOpen, setLogOpen] = useState(false);
+  const logCounter = useRef(0);
+  const logEnd = useRef<HTMLDivElement>(null);
   const [topics, setTopics] = useState<Data[]>([]);
   const [inputType, setInputType] = useState<"keywords" | "source_ai" | "source_verbatim" | "json">("keywords");
   const [selectedScene, setSelectedScene] = useState(0);
@@ -138,29 +157,58 @@ export default function Home() {
   const [outlineText, setOutlineText] = useState("");
   const [models, setModels] = useState<string[]>([]);
 
+  const errorCount = logs.filter(entry => entry.kind === "error").length;
+  const warnCount = logs.filter(entry => entry.kind === "warn").length;
+  useEffect(() => { if (logOpen) logEnd.current?.scrollIntoView({ block: "end" }); }, [logs, logOpen]);
   const steps = useMemo(() => kind && mode ? stepsFor(kind, mode) : [], [kind, mode]);
   const step = steps[stepIndex]?.key;
   const patch = (values: Data) => setState(previous => ({ ...previous, ...values }));
   const patchRender = (values: Data) => setRender(previous => ({ ...previous, ...values }));
-  const call = useCallback(async <T,>(method: string, params: Data = {}): Promise<T> => {
-    if (!window.kv) throw new Error("Hãy mở giao diện bằng Electron: npm run dev hoặc npm start.");
-    return window.kv.call<T>(method, params);
+  // The Python bridge runs one request at a time and rejects any request sent while another is running
+  // ("Một tác vụ khác đang chạy"), e.g. bootstrap and the model list both fired on start. Queue them instead.
+  const queue = useRef<Promise<unknown>>(Promise.resolve());
+  const call = useCallback(<T,>(method: string, params: Data = {}): Promise<T> => {
+    if (!window.kv) return Promise.reject(new Error("Hãy mở giao diện bằng Electron: npm run dev hoặc npm start."));
+    const run = queue.current.catch(() => undefined).then(() => window.kv!.call<T>(method, params));
+    queue.current = run.catch(() => undefined);
+    return run;
+  }, []);
+  const addLog = useCallback((kind: LogKind, text: string, percent = -1) => {
+    setLogs(previous => {
+      const last = previous[previous.length - 1];
+      if (kind === "progress" && last?.kind === "progress" && last.text === text) {
+        return [...previous.slice(0, -1), { ...last, percent }];  // same stage, newer percent
+      }
+      return [...previous, { id: ++logCounter.current, time: new Date(), kind, text, percent }].slice(-400);
+    });
   }, []);
   const work = useCallback(async (label: string, action: () => Promise<void>) => {
     setBusy(true); setNotice(""); setStatus(label); setPercent(-1);
-    try { await action(); setStatus(""); }
-    catch (error) { setNotice(error instanceof Error ? error.message : String(error)); setStatus(""); }
-    finally { setBusy(false); }
-  }, []);
+    const started = Date.now();
+    addLog("start", label);
+    try {
+      await action(); setStatus("");
+      addLog("done", `${label} xong · ${formatSeconds((Date.now() - started) / 1000)}`);
+    } catch (error) {
+      const text = readableError(error);
+      setNotice(text); setFailure({ title: label, text }); setStatus("");
+      addLog("error", `${label}: ${text}`);
+    } finally { setBusy(false); }
+  }, [addLog]);
+  const warn = useCallback((warnings: string[] | undefined) => {
+    if (!warnings?.length) return;
+    setNotice(warnings.join(" · "));
+    warnings.forEach(text => addLog("warn", text));
+  }, [addLog]);
 
   useEffect(() => {
-    const off = window.kv?.onProgress(value => { setStatus(value.label); setPercent(value.percent); });
+    const off = window.kv?.onProgress(value => { setStatus(value.label); setPercent(value.percent); addLog("progress", value.label, value.percent); });
     if (window.kv) call<Data>("bootstrap").then(data => {
       setCatalog(data.catalog || {}); setSettings(data.settings || {}); setRuns(data.runs || []);
       setOutputDir(data.output_dir || ""); setCacheMb(data.cache_mb || 0);
-    }).catch(error => setNotice(error.message));
+    }).catch(error => { const text = readableError(error); setNotice(text); addLog("error", `Khởi động: ${text}`); });
     return () => off?.();
-  }, [call]);
+  }, [call, addLog]);
   // Model list of the chosen AI, loaded quietly so the dropdown and the cheap backups are ready.
   const loadModels = useCallback(async (name: string) => {
     const data = await call<Data>("list_models", { provider: name });
@@ -187,7 +235,7 @@ export default function Home() {
   const operate = async (method: string, next: Data = state, extras: Data = {}) => {
     const result = await call<Data>(method, { directory, state: next, ...ai, ...extras });
     if (result.state) setState(result.state);
-    if (result.warnings?.length) setNotice(result.warnings.join(" · "));
+    warn(result.warnings);
     return result;
   };
   const refreshRuns = async () => { const result = await call<Data>("list_runs"); setRuns(result.runs || []); };
@@ -308,7 +356,7 @@ export default function Home() {
     }
     const options = { ...render, voice: current.voice };
     const result = await call<Data>(mode === "auto" ? "auto_generate" : "render_video", { directory: dir, state: current, options, ...ai });
-    setState(result.state); if (result.warnings?.length) setNotice(result.warnings.join(" · "));
+    setState(result.state); warn(result.warnings);
     await refreshRuns();
   });
   const preview = () => work("Dựng xem trước", async () => {
@@ -354,7 +402,7 @@ export default function Home() {
     </aside>
 
     <main className="main">
-      <header className="topbar"><div className="breadcrumbs"><span>Workspace</span><span className="slash">/</span><strong>{{ create: "Tạo video", history: "Lịch sử video", templates: "Thư viện mẫu", settings: "Cài đặt" }[tab]}</strong></div><div className="top-actions"><span className="status-dot"/> <span>Ứng dụng trên máy</span></div></header>
+      <header className="topbar"><div className="breadcrumbs"><span>Workspace</span><span className="slash">/</span><strong>{{ create: "Tạo video", history: "Lịch sử video", templates: "Thư viện mẫu", settings: "Cài đặt" }[tab]}</strong></div><div className="top-actions"><button className={`log-toggle ${logOpen ? "active" : ""}`} onClick={() => setLogOpen(open => !open)}><Icon name="layers" size={15}/> Nhật ký{errorCount > 0 ? <span className="log-badge error">{errorCount}</span> : warnCount > 0 ? <span className="log-badge warn">{warnCount}</span> : null}</button><span className="status-dot"/> <span>Ứng dụng trên máy</span></div></header>
       <div className="scroll-area"><div className="content">
         {notice && <div className="notice"><span>{notice}</span><button onClick={() => setNotice("")}>×</button></div>}
         {tab === "create" && <>
@@ -404,6 +452,11 @@ export default function Home() {
         {tab === "templates" && <><div className="page-heading"><div className="eyebrow">THƯ VIỆN DIỆN MẠO</div><h1>Mẫu video</h1><p>Xem các template dựng video lịch sử và áp dụng cho dự án.</p></div><div className="gallery-grid">{Object.entries(catalog.templates || {}).map(([key, label]) => <Card key={key} className="gallery-card"><div className={`gallery-art ${templateNotes[key]?.[2] || "scroll"}`}>{gallery[key] ? <LocalMedia path={gallery[key]}/> : <strong>{templateNotes[key]?.[0] || String(label)}</strong>}</div><div className="gallery-info"><h2>{label as string}</h2><p>{templateNotes[key]?.[1]}</p><div className="button-row"><button className="secondary small" disabled={busy} onClick={() => work("Xem trước mẫu", async () => { const data = await call<Data>("render_preview", { template: key, transition: "template", motion: true }); setPreviewPath(data.video); })}>Xem chuyển động</button><button className="primary small" onClick={() => useTemplate(key)}>Dùng mẫu</button></div></div></Card>)}</div>{previewPath && <Card title="Xem trước template"><div className="gallery-preview"><LocalMedia path={previewPath} video/></div></Card>}</>}
         {tab === "settings" && <><div className="page-heading"><div className="eyebrow">THIẾT LẬP ỨNG DỤNG</div><h1>Cài đặt</h1><p>AI, nơi lưu video và công cụ dựng trên máy này.</p></div><div className="stack"><Card title="AI & tích hợp"><div className="form-grid settings-grid">{settingFields.slice(0, 10).map(([key, label, type]) => <Field label={label} key={key}><input type={type} value={settings[key] || ""} onChange={e => setSettings(previous => ({ ...previous, [key]: e.target.value }))}/></Field>)}</div></Card><Card title="Lưu trữ & video"><div className="form-grid settings-grid">{settingFields.slice(10).map(([key, label, type]) => <Field label={label} key={key}><div className="input-action"><input type={type} value={settings[key] || ""} onChange={e => setSettings(previous => ({ ...previous, [key]: e.target.value }))}/>{["KV_OUTPUT_DIR", "KV_VIDEO_FONT"].includes(key) && <button onClick={() => (key === "KV_OUTPUT_DIR" ? window.kv?.chooseFolder() : window.kv?.chooseFile("font"))?.then(value => value && setSettings(previous => ({ ...previous, [key]: value })))}><Icon name="folder" size={16}/></button>}</div></Field>)}</div><div className="settings-actions"><span>Cache clip: {cacheMb} MB · Output: {outputDir}</span><button className="secondary" disabled={busy} onClick={() => work("Dọn cache", async () => { const data = await call<Data>("clear_cache"); setCacheMb(data.cache_mb); })}>Dọn cache clip</button><button className="primary" disabled={busy} onClick={() => work("Lưu cài đặt", async () => { const data = await call<Data>("save_settings", { values: settings }); setSettings(data.settings); setOutputDir(data.output_dir); setNotice("Đã lưu cài đặt."); })}>Lưu cài đặt</button></div></Card></div></>}
       </div></div>
+      {failure && <div className="error-toast" role="alert"><span className="error-toast-icon">!</span><div><strong>{failure.title} không thành công</strong><p>{failure.text}</p><div className="error-toast-actions"><button onClick={() => { setLogOpen(true); setFailure(null); }}>Xem nhật ký</button><button onClick={() => window.kv?.copyText(`${failure.title}: ${failure.text}`)}>Sao chép</button></div></div><button className="error-toast-close" aria-label="Đóng" onClick={() => setFailure(null)}>×</button></div>}
+      {logOpen && <section className="log-panel" aria-label="Nhật ký">
+        <header><div><strong>Nhật ký</strong><span>{logs.length} dòng{errorCount ? ` · ${errorCount} lỗi` : ""}{warnCount ? ` · ${warnCount} cảnh báo` : ""}</span></div><div className="log-actions"><button disabled={!logs.length} onClick={() => window.kv?.copyText(logs.map(l => `${clock(l.time)} [${logLabels[l.kind]}] ${l.text}${l.percent >= 0 ? ` (${l.percent}%)` : ""}`).join("\n"))}>Sao chép</button><button disabled={!logs.length} onClick={() => setLogs([])}>Xóa</button><button aria-label="Đóng nhật ký" onClick={() => setLogOpen(false)}>×</button></div></header>
+        <div className="log-list">{logs.length ? logs.map(entry => <div key={entry.id} className={`log-row ${entry.kind}`}><time>{clock(entry.time)}</time><span className="log-kind">{logLabels[entry.kind]}</span><p>{entry.text}</p>{entry.kind === "progress" && entry.percent >= 0 && <span className="log-percent">{entry.percent}%</span>}</div>) : <p className="log-empty">Chưa có hoạt động nào. Các bước, cảnh báo và lỗi sẽ hiện ở đây.</p>}<div ref={logEnd}/></div>
+      </section>}
       {busy && <div className="busy-bar"><div className="busy-progress" style={{ width: percent >= 0 ? `${Math.max(3, percent)}%` : "35%" }}/><span>{status || "Đang xử lý"}</span>{percent >= 0 && <strong>{percent}%</strong>}<button onClick={() => window.kv?.cancel()}>Hủy</button></div>}
     </main>
   </div>;

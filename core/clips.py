@@ -12,6 +12,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 import time
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -596,8 +597,21 @@ _DESCRIBE_SCHEMA = {
 }
 
 
+_SHEET_LOCK = threading.Lock()
+
+
 def _contact_sheet(paths: list[Path], output: Path) -> None:
-    """3x3 grid of shot frames, each numbered 1-9 in its corner, so the model can refer to them."""
+    """3x3 grid of shot frames, each numbered 1-9 in its corner, so the model can refer to them.
+
+    Drawn one at a time: the vision grids run in parallel threads, and Qt text painting from several threads at
+    once crashed the process (access violation) or raised "QFont has no attribute 'Bold'". A grid takes ~0.1 s
+    to draw; the vision calls themselves still overlap.
+    """
+    with _SHEET_LOCK:
+        _draw_contact_sheet(paths, output)
+
+
+def _draw_contact_sheet(paths: list[Path], output: Path) -> None:
     from PySide6.QtCore import QRect, Qt
     from PySide6.QtGui import QColor, QFont, QImage, QPainter
 

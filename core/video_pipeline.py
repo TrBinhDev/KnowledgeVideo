@@ -397,8 +397,9 @@ def _asset_kind(path: Path, info: dict) -> str:
     return "video" if any(stream.get("codec_type") == "video" for stream in info.get("streams", [])) else "image"
 
 
-# Edge TTS sometimes answers "no audio" for a minute or so; retries wait longer each time (None = give up).
-_TTS_RETRY_PAUSES = (5, 15, 30, None)
+# Edge TTS sometimes answers "no audio"; on 2026-09-30 it failed 2 of 3 back-to-back calls at random rather than
+# for a whole minute, so more tries with short waits beat a few long ones (None = give up; ~65 s of waiting).
+_TTS_RETRY_PAUSES = (2, 3, 5, 10, 15, 30, None)
 _SENTENCE_BREAK = re.compile(r"(?<=[.!?…])\s+|\n+")
 MIN_SCENE_SECONDS = 2.0
 

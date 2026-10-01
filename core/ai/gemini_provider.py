@@ -266,7 +266,18 @@ class GeminiProvider(BaseAIProvider):
             self._model = model  # model_name now reports the model that actually answered
             self._notify(f"{endpoint.label} đã trả lời: {model}")
             content = "".join(str(part.get("text", "")) for part in _parts(data)).strip()
-            return parse_json_text(content, endpoint.label)
+            try:
+                return parse_json_text(content, endpoint.label)
+            except ProviderResponseError as error:
+                # Broken JSON (cut off or mangled) is usually a one-off: ask the same model once more.
+                logger.warning("gemini_invalid_json model=%s chars=%d retrying", model, len(content))
+                self._notify(f"{endpoint.label} trả JSON lỗi, gọi lại {model}")
+                retry = _post(endpoint, model, payload, self._api_key, self._timeout)
+                content = "".join(str(part.get("text", "")) for part in _parts(retry)).strip()
+                try:
+                    return parse_json_text(content, endpoint.label)
+                except ProviderResponseError:
+                    raise error from None
         hint = "" if self._fallbacks else " Bấm \"Làm mới\" danh sách model để có model dự phòng."
         raise ProviderModelUnavailable(f"Không model nào của {endpoint.label} dùng được lúc này:\n- "
                                        + "\n- ".join(failures) + hint)
