@@ -1,5 +1,29 @@
 # KnowledgeVideo
 
+## Giao diện hiện tại: Next.js + Electron
+
+Giao diện mới nằm trong `frontend/` và dùng lại toàn bộ phần xử lý Python trong `core/`. Sidebar gồm **Tạo video**, **Lịch sử video**, **Thư viện mẫu** và **Cài đặt**. Trong Tạo video, chọn **Ảnh / Clip**, sau đó chọn **Tự động / Thủ công**. Số bước thay đổi theo luồng; template, chuyển cảnh, phụ đề và xem trước được chọn trước khi tạo video.
+
+Sau khi cài Python và FFmpeg theo phần yêu cầu bên dưới, cài frontend và chạy:
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+Để chạy bản build tĩnh trong Electron:
+
+```powershell
+cd frontend
+npm run build
+npm start
+```
+
+Node.js và npm là yêu cầu bổ sung cho giao diện mới. Có thể đặt `KV_PYTHON` tới Python đã cài `requirements.txt`; mặc định Electron dùng `.venv/Scripts/python.exe` trong thư mục dự án. Xem [hướng dẫn frontend](frontend/README.md) để biết cấu trúc và lệnh kiểm tra.
+
+## Tài liệu giao diện PySide6 cũ
+
 Ứng dụng desktop (PySide6) tạo **video dọc 9:16 về kiến thức lịch sử** từ một chủ đề: AI gợi ý chủ đề, lập đề cương, viết kịch bản, chia cảnh, tự tìm ảnh tư liệu, đọc giọng tiếng Việt và render ra MP4.
 
 Đây là bản thử nghiệm (prototype) cho luồng "Kiến thức" của dự án VIAI; chạy hoàn toàn trên máy, không cần database.
