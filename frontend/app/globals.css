@@ -59,3 +59,5 @@
 .log-row.error{background:#3a1a22}.log-row.error .log-kind{background:#e5484d;color:#fff}.log-row.error p{color:#ffd5d7}
 .log-percent{font-family:ui-monospace,Consolas,monospace;font-size:10.5px;color:#7cc2ff;background:#1b2840;border-radius:5px;padding:1px 6px}
 .log-empty{color:#7f7aa6;text-align:center;padding:22px 10px;margin:0}
+.gallery-toolbar{max-width:260px;margin:-12px 0 24px}
+.inkwash{background:linear-gradient(170deg,#9fb0b4,#efe8d8 58%,#e6dcc6);color:#1f2a2e}.battle{background:linear-gradient(160deg,#4b5534,#1e2414 70%);color:#d6c89a}.modern{background:linear-gradient(160deg,#ff5a36 0 38%,#101830 38%);color:#fff;font-family:'Segoe UI',sans-serif}

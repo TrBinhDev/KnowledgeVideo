@@ -4,11 +4,12 @@ They reuse the render's per-scene filter, grade, title card, transition joins an
 what is previewed is what the final video shows, minus subtitles and voice.
 """
 import hashlib
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
 from core import samples
-from core.config import RunStore, list_runs, output_directory
+from core.config import RunStore
 from core.render import _content_label, _year_badge
 from core.title_cards import HISTORY_GRADES, HISTORY_TEMPLATES, render_title_card
 from core.video_pipeline import (
@@ -62,14 +63,8 @@ def run_source(store: RunStore, state: dict, count: int = SCENES) -> PreviewSour
 
 
 def gallery_source(count: int = SCENES) -> PreviewSource:
-    """For the template gallery: the newest video that has images, else pictures drawn as samples."""
-    cache = output_directory() / "_gallery"
-    for directory, state in list_runs():
-        images = _run_images(directory, state)
-        if images:
-            title = (state.get("script") or {}).get("title") or state.get("topic") or ""
-            return PreviewSource(_repeat(images[:count], count), title, _year_badge(title, state.get("topic", "")),
-                                 _content_label(state), cache, f"ảnh của video “{title}”")
+    """For the template gallery: always the plain sample pictures, cached in the system temp folder (not output/)."""
+    cache = Path(tempfile.gettempdir()) / "KnowledgeVideo" / "preview"
     images = samples.sample_images(cache / "samples")
     return PreviewSource(_repeat(images, count), samples.TITLE, _year_badge(samples.TITLE), "Kiến thức lịch sử",
                          cache, "ảnh minh họa mẫu")

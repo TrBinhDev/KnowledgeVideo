@@ -2,7 +2,9 @@ const { app, BrowserWindow, clipboard, dialog, ipcMain, net, protocol, shell } =
 const { spawn } = require("node:child_process");
 const crypto = require("node:crypto");
 const fs = require("node:fs");
+const os = require("node:os");
 const path = require("node:path");
+const { Readable } = require("node:stream");
 const { pathToFileURL } = require("node:url");
 
 const frontend = path.resolve(__dirname, "..");
@@ -33,6 +35,13 @@ const chunks = new Map();
 function inside(root, target) {
   const relative = path.relative(path.resolve(root), path.resolve(target));
   return relative === "" || (!relative.startsWith(".." + path.sep) && relative !== ".." && !path.isAbsolute(relative));
+}
+
+// Template gallery previews are cached here by core/preview.py so they stay out of output/.
+const previewRoot = path.join(os.tmpdir(), "KnowledgeVideo", "preview");
+
+function mediaAllowed(file) {
+  return inside(outputRoot, file) || inside(previewRoot, file);
 }
 
 function senderAllowed(event) {
@@ -113,6 +122,29 @@ function callBackend(method, params = {}) {
   });
 }
 
+const mediaTypes = {
+  ".mp4": "video/mp4", ".webm": "video/webm", ".mov": "video/quicktime",
+  ".mp3": "audio/mpeg", ".wav": "audio/wav", ".m4a": "audio/mp4",
+  ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp", ".gif": "image/gif",
+};
+
+// net.fetch(file://) ignores Range, so <video> got no 206 and could not seek.
+function serveMedia(request, file) {
+  const size = fs.statSync(file).size;
+  const headers = { "content-type": mediaTypes[path.extname(file).toLowerCase()] || "application/octet-stream", "accept-ranges": "bytes" };
+  const match = /^bytes=(\d*)-(\d*)$/.exec((request.headers.get("range") || "").trim());
+  if (!match || (!match[1] && !match[2])) {
+    return new Response(Readable.toWeb(fs.createReadStream(file)), { status: 200, headers: { ...headers, "content-length": String(size) } });
+  }
+  const start = match[1] ? Number(match[1]) : Math.max(0, size - Number(match[2]));
+  const end = match[1] && match[2] ? Math.min(Number(match[2]), size - 1) : size - 1;
+  if (start >= size || start > end) return new Response(null, { status: 416, headers: { "content-range": `bytes */${size}` } });
+  return new Response(Readable.toWeb(fs.createReadStream(file, { start, end })), {
+    status: 206,
+    headers: { ...headers, "content-length": String(end - start + 1), "content-range": `bytes ${start}-${end}/${size}` },
+  });
+}
+
 function registerProtocols() {
   protocol.handle("kvapp", (request) => {
     const url = new URL(request.url);
@@ -125,8 +157,8 @@ function registerProtocols() {
   protocol.handle("kvmedia", (request) => {
     const token = new URL(request.url).pathname.slice(1);
     const file = media.get(token);
-    if (!file || !inside(outputRoot, file) || !fs.existsSync(file)) return new Response("Not found", { status: 404 });
-    return net.fetch(pathToFileURL(file).toString());
+    if (!file || !mediaAllowed(file) || !fs.existsSync(file)) return new Response("Not found", { status: 404 });
+    return serveMedia(request, file);
   });
 }
 
@@ -202,7 +234,7 @@ app.whenReady().then(() => {
   ipcMain.handle("kv:media-url", (event, value) => {
     if (!senderAllowed(event)) throw new Error("Untrusted renderer.");
     const file = path.resolve(String(value || ""));
-    if (!inside(outputRoot, file) || !fs.existsSync(file)) return "";
+    if (!mediaAllowed(file) || !fs.existsSync(file)) return "";
     const token = crypto.randomUUID();
     media.set(token, file);
     if (media.size > 2000) media.delete(media.keys().next().value);
