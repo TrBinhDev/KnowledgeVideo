@@ -1,5 +1,6 @@
 "use client";
 
+import * as RadixSelect from "@radix-ui/react-select";
 import { useCallback, useEffect, useMemo, useState } from "react";
 
 type Data = Record<string, any>;
@@ -65,8 +66,16 @@ function LocalMedia({ path, video = false, className = "" }: { path?: string; vi
 function Field({ label, hint, children }: { label: string; hint?: string; children: React.ReactNode }) {
   return <label className="field"><span className="field-label">{label}</span>{children}{hint && <span className="field-hint">{hint}</span>}</label>;
 }
+// Radix reserves "" for "no value", but several lists use "" as a real choice ("Tự động", "Mặc định").
+const EMPTY_CHOICE = "__empty__";
 function Select({ value, onChange, options }: { value: string | number; onChange: (v: string) => void; options: [string, string][] }) {
-  return <select value={String(value ?? "")} onChange={e => onChange(e.target.value)}>{options.map(([key, label]) => <option key={key} value={key}>{label}</option>)}</select>;
+  const current = String(value ?? "");
+  return <RadixSelect.Root value={current === "" ? EMPTY_CHOICE : current} onValueChange={v => onChange(v === EMPTY_CHOICE ? "" : v)}>
+    <RadixSelect.Trigger className="kv-select-trigger"><RadixSelect.Value/><RadixSelect.Icon className="kv-select-chevron"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true"><path d="m6 9 6 6 6-6"/></svg></RadixSelect.Icon></RadixSelect.Trigger>
+    <RadixSelect.Portal><RadixSelect.Content className="kv-select-content" position="popper" sideOffset={6}><RadixSelect.Viewport className="kv-select-viewport">
+      {options.map(([key, label]) => <RadixSelect.Item key={key} value={key === "" ? EMPTY_CHOICE : key} className="kv-select-item"><RadixSelect.ItemText>{label}</RadixSelect.ItemText><RadixSelect.ItemIndicator className="kv-select-check"><Icon name="check" size={14}/></RadixSelect.ItemIndicator></RadixSelect.Item>)}
+    </RadixSelect.Viewport></RadixSelect.Content></RadixSelect.Portal>
+  </RadixSelect.Root>;
 }
 function Pill({ active, children, onClick }: { active?: boolean; children: React.ReactNode; onClick: () => void }) {
   return <button type="button" className={`pill ${active ? "active" : ""}`} onClick={onClick}>{children}</button>;

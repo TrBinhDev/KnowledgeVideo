@@ -10,3 +10,17 @@
 .flow-note{background:#f0edff;border:1px solid #e5dfff;border-radius:11px;padding:14px 18px}.flow-note span{color:#7255e6;font-size:10px;letter-spacing:.08em;text-transform:uppercase;font-weight:800}.flow-note p{font-size:11px;line-height:1.55;color:#776caa;margin:5px 0 0}
 .field select,select{appearance:none;-webkit-appearance:none;border-radius:12px;padding-right:36px;cursor:pointer;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='16' height='16' viewBox='0 0 24 24' fill='none' stroke='%238790a5' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='m6 9 6 6 6-6'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 12px center;background-size:16px}
 .field select:hover,select:hover{border-color:#d3d7e4}
+.kv-select-trigger{width:100%;min-height:39px;display:flex;align-items:center;justify-content:space-between;gap:8px;border:1px solid #e6e9f1;background:#fbfcfe;border-radius:12px;padding:9px 12px;font-size:12px;color:#354058;cursor:pointer;outline:none;text-align:left;transition:border-color .15s,box-shadow .15s}
+.kv-select-trigger:hover{border-color:#d3d7e4}
+.kv-select-trigger:focus-visible,.kv-select-trigger[data-state=open]{border-color:#aa9af7;box-shadow:0 0 0 3px #eeeaff}
+.kv-select-trigger>span:first-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kv-select-chevron{display:flex;color:#8790a5;transition:transform .15s}
+.kv-select-trigger[data-state=open] .kv-select-chevron{transform:rotate(180deg)}
+.kv-select-content{z-index:1000;min-width:var(--radix-select-trigger-width);max-height:min(320px,var(--radix-select-content-available-height));overflow:hidden;background:#fff;border:1px solid #ebeef5;border-radius:14px;box-shadow:0 16px 40px rgba(36,44,76,.14),0 2px 6px rgba(36,44,76,.06);animation:kv-select-in .12s ease-out}
+.kv-select-viewport{padding:6px}
+.kv-select-item{position:relative;display:flex;align-items:center;justify-content:space-between;gap:10px;padding:9px 10px 9px 12px;border-radius:9px;font-size:12px;color:#354058;cursor:pointer;outline:none;user-select:none}
+.kv-select-item[data-highlighted]{background:#f3f0ff;color:#5434d5}
+.kv-select-item[data-state=checked]{font-weight:700;color:#5434d5}
+.kv-select-item[data-disabled]{opacity:.45;cursor:default}
+.kv-select-check{display:flex;color:#6848e8}
+@keyframes kv-select-in{from{opacity:0;transform:translateY(-4px)}to{opacity:1;transform:none}}
