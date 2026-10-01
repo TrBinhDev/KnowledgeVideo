@@ -15,7 +15,7 @@ const allowedMethods = new Set([
   "bootstrap", "list_runs", "open_run", "list_models", "settings", "save_settings", "clear_cache", "load_document", "parse_json", "parse_source",
   "suggest_topics", "create_run", "save_run", "make_outline", "update_outline", "write_script", "fit_script",
   "split_scenes", "fetch_images", "replace_image", "search_clips", "prepare_clips", "reassign_clips",
-  "choose_shot", "use_picture", "set_logos", "render_preview", "gallery", "render_video", "auto_generate", "export_video", "get_credits",
+  "choose_shot", "use_picture", "set_logos", "render_preview", "gallery", "render_video", "auto_generate", "export_video", "get_credits", "storage_usage",
 ]);
 
 protocol.registerSchemesAsPrivileged([

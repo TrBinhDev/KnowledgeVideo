@@ -87,6 +87,10 @@ function Card({ title, description, children, className = "" }: { title?: string
 type LogKind = "start" | "progress" | "done" | "warn" | "error";
 interface LogEntry { id: number; time: Date; kind: LogKind; text: string; percent: number }
 const logLabels: Record<LogKind, string> = { start: "Bắt đầu", progress: "Đang làm", done: "Xong", warn: "Cảnh báo", error: "Lỗi" };
+const formatBytes = (bytes: number) => bytes >= 1024 ** 3 ? `${(bytes / 1024 ** 3).toFixed(1)} GB` : bytes >= 1024 ** 2 ? `${Math.round(bytes / 1024 ** 2)} MB` : `${Math.max(1, Math.round(bytes / 1024))} KB`;
+const specialFolders: Record<string, string> = { _clip_cache: "Cache clip YouTube", _voice_cache: "Cache giọng đọc", _gallery: "Ảnh mẫu (cũ)", logs: "Nhật ký", "": "Tệp lẻ" };
+// Run folders are "YYYYMMDD_HHMMSS__slug": show the slug as words.
+const folderLabel = (name: string) => specialFolders[name] ?? (name.replace(/^\d{8}_\d{6}__/, "").replace(/-/g, " ") || name);
 const formatSeconds = (seconds: number) => seconds < 60 ? `${seconds.toFixed(seconds < 10 ? 1 : 0)} giây` : `${Math.floor(seconds / 60)} phút ${Math.round(seconds % 60)} giây`;
 const clock = (time: Date) => time.toLocaleTimeString("vi-VN", { hour12: false });
 /** Electron wraps bridge errors as "Error invoking remote method 'kv:call': Error: <message>"; keep the message. */
@@ -143,6 +147,7 @@ export default function Home() {
   const [outputDir, setOutputDir] = useState("");
   const [cacheMb, setCacheMb] = useState(0);
   const [busy, setBusy] = useState(false);
+  const [storage, setStorage] = useState<{ total: number; folders: { name: string; bytes: number }[] } | null>(null);
   const [status, setStatus] = useState("");
   const [percent, setPercent] = useState(-1);
   const [notice, setNotice] = useState("");
@@ -242,6 +247,12 @@ export default function Home() {
     warn(result.warnings);
     return result;
   };
+  const loadStorage = useCallback(() => {
+    if (!window.kv) return;
+    call<Data>("storage_usage").then(data => setStorage({ total: data.total || 0, folders: data.folders || [] })).catch(() => undefined);
+  }, [call]);
+  // Refresh after every task, since renders, caches and deletes all change the sizes.
+  useEffect(() => { if (!busy) loadStorage(); }, [busy, loadStorage]);
   const refreshRuns = async () => { const result = await call<Data>("list_runs"); setRuns(result.runs || []); };
   const start = (newKind: Kind, newMode: Mode) => {
     setKind(newKind); setMode(newMode); setReached(0); setStepIndex(0); setDirectory("");
@@ -402,7 +413,7 @@ export default function Home() {
           <button key={key} className={`side-item ${tab === key ? "active" : ""}`} onClick={() => { if (key === "create" && !directory && !String(state.input || "").trim()) { newVideo(); return; } setTab(key); setNotice(""); if (key === "history") refreshRuns().catch(e => setNotice(e.message)); if (key === "templates" && !Object.keys(gallery).length) work("Đang tải mẫu", async () => { const data = await call<Data>("gallery"); setGallery(data.thumbnails || {}); }); }}><Icon name={icon} size={19}/><span>{label}</span>{key === "create" && <span className="side-plus">+</span>}</button>
         )}
       </nav>
-      <div className="sidebar-bottom"><div className="sidebar-help"><span className="help-icon"><Icon name="spark" size={16}/></span><strong>Từ ý tưởng đến video</strong><p>Biên tập video kiến thức theo cách của bạn.</p></div><div className="sidebar-version">KnowledgeVideo · Desktop</div></div>
+      <div className="sidebar-bottom">{storage && <div className="storage-box"><div className="storage-head"><strong>Dung lượng output</strong><button className="storage-refresh" title="Tính lại" disabled={busy} onClick={loadStorage}>⟳</button></div><div className="storage-total">{formatBytes(storage.total)}<span>{storage.folders.length} thư mục</span></div><div className="storage-list">{storage.folders.length ? storage.folders.map(item => <div key={item.name} className="storage-row" title={item.name || "Tệp nằm ngay trong output"}><div className="storage-row-text"><span>{folderLabel(item.name)}</span><b>{formatBytes(item.bytes)}</b></div><div className="storage-bar"><i style={{ width: `${storage.total ? Math.max(2, item.bytes / storage.total * 100) : 0}%` }}/></div></div>) : <p className="storage-empty">Thư mục output đang trống.</p>}</div></div>}<div className="sidebar-help"><span className="help-icon"><Icon name="spark" size={16}/></span><strong>Từ ý tưởng đến video</strong><p>Biên tập video kiến thức theo cách của bạn.</p></div><div className="sidebar-version">KnowledgeVideo · Desktop</div></div>
     </aside>
 
     <main className="main">

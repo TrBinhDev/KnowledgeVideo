@@ -196,7 +196,39 @@ def render_current(store: RunStore, state: dict, options: dict) -> dict:
     return {"directory": str(store.directory), "state": state, "video": str(video)}
 
 
+def _folder_bytes(folder: Path) -> int:
+    total = 0
+    for root, _dirs, files in os.walk(folder):
+        for name in files:
+            try:
+                total += os.path.getsize(os.path.join(root, name))
+            except OSError:
+                pass
+    return total
+
+
+def storage_usage() -> dict:
+    """Size of every top-level folder in the output directory (loose files summed as one row), largest first."""
+    root = output_directory()
+    folders, loose = [], 0
+    if root.is_dir():
+        for entry in os.scandir(root):
+            try:
+                if entry.is_dir(follow_symlinks=False):
+                    folders.append({"name": entry.name, "bytes": _folder_bytes(Path(entry.path))})
+                elif entry.is_file(follow_symlinks=False):
+                    loose += entry.stat().st_size
+            except OSError:
+                pass
+    if loose:
+        folders.append({"name": "", "bytes": loose})
+    folders.sort(key=lambda item: item["bytes"], reverse=True)
+    return {"output_dir": str(root), "total": sum(item["bytes"] for item in folders), "folders": folders}
+
+
 def dispatch(method: str, params: dict):
+    if method == "storage_usage":
+        return storage_usage()
     if method == "bootstrap":
         return {"catalog": catalog_data(), "settings": get_settings(), "runs": runs(),
                 "output_dir": str(output_directory()), "cache_mb": round(clips.cache_size() / 1024 / 1024)}
