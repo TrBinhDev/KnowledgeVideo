@@ -382,13 +382,24 @@ def dispatch(method: str, params: dict):
         return {**persist(store, state), "warnings": notes}
     if method == "set_logos":
         store, state = saved_run(params)
+
+        def valid(box) -> bool:
+            return (isinstance(box, list) and len(box) == 4 and all(isinstance(n, (float, int)) and 0 <= n <= 1
+                                                                     for n in box))
+
         boxes = params.get("logos") or []
-        if not isinstance(boxes, list) or any(not isinstance(box, list) or len(box) != 4 or
-                                              any(not isinstance(n, (float, int)) or n < 0 or n > 1 for n in box)
-                                              for box in boxes):
+        if not isinstance(boxes, list) or not all(valid(box) for box in boxes):
             raise ValueError("Vùng logo phải là các tọa độ tỷ lệ từ 0 đến 1.")
         state["clip_source"]["logos"] = boxes
         state["clip_source"]["logos_from"] = "manual"
+        if "subtitles" in params:
+            band = params.get("subtitles")
+            if band is not None and not valid(band):
+                raise ValueError("Vùng phụ đề phải là các tọa độ tỷ lệ từ 0 đến 1.")
+            # The detected timing is kept when the band is moved; a band drawn by hand without it is blurred always.
+            subtitles = state["clip_source"].get("subtitles") or dict(clips.NO_SUBTITLES)
+            state["clip_source"]["subtitles"] = {**subtitles, "box": band, "from": "manual"}
+            clips.refresh_subtitle_marks(state)
         return persist(store, state)
     if method == "render_preview":
         template = params.get("template") or "history-scroll"
@@ -462,7 +473,7 @@ def dispatch(method: str, params: dict):
                     if best and best.get("score", 0) >= clips.GOOD_SCORE:
                         break
                 unique = {item["id"]: item for item in candidates}
-                state["clip_candidates"] = sorted(unique.values(), key=lambda item: (not item["allowed"], -item["score"]))
+                state["clip_candidates"] = sorted(unique.values(), key=clips.candidate_order)
                 persist(store, state)
                 best = clips.best_candidate(state["clip_candidates"])
                 if not best or best.get("score", 0) < clips.GOOD_SCORE:

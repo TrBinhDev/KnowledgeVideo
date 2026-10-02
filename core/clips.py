@@ -11,6 +11,7 @@ import math
 import os
 import re
 import shutil
+import statistics
 import subprocess
 import threading
 import time
@@ -290,6 +291,7 @@ _CLASSIFY_PROMPT = (
     "slides (presentation slides or text screens), illustration (drawn or painted images, slideshow), "
     "animation_3d (3D or cartoon animation), talking_head (a presenter talking to camera).\n"
     "watermark: true if a channel logo or station name is burned into the corner of the frames.\n"
+    "subtitles: true if lines of subtitle or caption text are burned into the bottom of many frames.\n"
     "score: 0-10, how well this video could illustrate a short video about: {about}\n"
     "Judge the title and the frames together. 10 = clearly this exact subject; 5 = same era or theme but not this "
     "subject; 0 = unrelated. If the title names a different event, year, battle or person than the subject (for "
@@ -299,11 +301,13 @@ _CLASSIFY_PROMPT = (
 _CLASSIFY_SCHEMA = {
     "type": "object",
     "properties": {"kind": {"type": "string", "enum": list(KIND_LABELS)}, "watermark": {"type": "boolean"},
-                   "score": {"type": "integer"}},
-    "required": ["kind", "watermark", "score"],
+                   "subtitles": {"type": "boolean"}, "score": {"type": "integer"}},
+    "required": ["kind", "watermark", "subtitles", "score"],
 }
 # A source video scoring below this is not picked automatically (auto mode searches again, then asks the user).
 GOOD_SCORE = 6
+# Burned-in subtitles are blurred, but a clean video looks better: it ranks as if it scored this much less.
+SUBTITLE_PENALTY = 2
 # Auto mode skips longer sources: the whole video is downloaded at 360p for the shot split.
 AUTO_MAX_SOURCE_SECONDS = 30 * 60
 
@@ -334,8 +338,9 @@ def storyboard_sheet(info: dict, directory: Path) -> Path | None:
     return sheet
 
 
-def classify(sheet: Path, vision=ollama_vision, about: str = "", title: str = "") -> tuple[str, bool, int]:
-    """Kind of video, burned-in logo, and a 0-10 score of how well it fits `about` (the video being made).
+def classify(sheet: Path, vision=ollama_vision, about: str = "", title: str = "") -> tuple[str, bool, int, bool]:
+    """Kind of video, burned-in logo, a 0-10 score of how well it fits `about` (the video being made), and
+    burned-in subtitles.
 
     The title goes along with the frames: battles, costumes and landscapes look alike across centuries, while the
     title tells which event the video is about."""
@@ -344,14 +349,24 @@ def classify(sheet: Path, vision=ollama_vision, about: str = "", title: str = ""
     kind = data.get("kind") if data.get("kind") in KIND_LABELS else "slides"
     score = data.get("score")
     score = max(0, min(10, score)) if isinstance(score, int) and not isinstance(score, bool) else 0
-    return kind, bool(data.get("watermark")), score
+    return kind, bool(data.get("watermark")), score, bool(data.get("subtitles"))
+
+
+def rank(item: dict) -> float:
+    """Ordering score of a candidate video: its fit, less SUBTITLE_PENALTY when it has burned-in subtitles."""
+    return item.get("score", 0) - (SUBTITLE_PENALTY if item.get("subtitles") else 0)
+
+
+def candidate_order(item: dict) -> tuple:
+    """Sort key of the candidate list: allowed kinds first, then best rank."""
+    return not item.get("allowed"), -rank(item)
 
 
 def best_candidate(candidates: list[dict], skip: set[str] = frozenset()) -> dict | None:
-    """Auto mode's pick: an allowed kind, not too long, highest score (None when nothing is usable)."""
+    """Auto mode's pick: an allowed kind, not too long, best rank (None when nothing is usable)."""
     usable = [item for item in candidates if item.get("allowed") and item["id"] not in skip
               and item["duration"] <= AUTO_MAX_SOURCE_SECONDS]
-    return max(usable, key=lambda item: item.get("score", 0), default=None)
+    return max(usable, key=rank, default=None)
 
 
 def find_candidates(query: str, content_filter: str, progress=None, limit: int = 8, vision=ollama_vision,
@@ -375,7 +390,8 @@ def find_candidates(query: str, content_filter: str, progress=None, limit: int =
         try:
             info = video_info(item["id"])
             sheet = storyboard_sheet(info, boards)
-            kind, watermark, score = classify(sheet, vision, about, item["title"]) if sheet else ("slides", False, 0)
+            kind, watermark, score, subtitles = (classify(sheet, vision, about, item["title"]) if sheet
+                                                 else ("slides", False, 0, False))
         except ClipError as error:
             logger.info("clip_candidate_skipped id=%s reason=%s", item["id"], error)
             return None
@@ -390,15 +406,16 @@ def find_candidates(query: str, content_filter: str, progress=None, limit: int =
                 progress(f"Đã xem thử {len(looked)}/{len(found)} video: {item['title'][:50]}",
                          round(100 * len(looked) / max(1, len(found))))
         return {**_source_fields(info), "kind": kind, "watermark": watermark, "score": score,
-                "allowed": kind in allowed, "board": str(sheet) if sheet else ""}
+                "subtitles": subtitles, "allowed": kind in allowed, "board": str(sheet) if sheet else ""}
 
     if progress:
         progress(f"Xem thử {len(found)} video", 0)
     # Reading a video's page and its storyboard is mostly waiting on YouTube, so several are looked at at once.
     candidates = [item for item in run_parallel(look_at, found, CANDIDATE_WORKERS) if item]
-    candidates.sort(key=lambda item: (not item["allowed"], -item["score"]))
+    candidates.sort(key=candidate_order)
     logger.info("clip_candidates query=%s | %s", query[:80],
-                ", ".join(f"{item['id']} {item['score']}/10{'' if item['allowed'] else ' (loại)'}" for item in candidates))
+                ", ".join(f"{item['id']} {item['score']}/10{' sub' if item['subtitles'] else ''}"
+                          f"{'' if item['allowed'] else ' (loại)'}" for item in candidates))
     return candidates
 
 
@@ -547,8 +564,109 @@ def detect_logos(path: Path, duration: float, samples: int = 30) -> list[list[fl
                    round((bottom - top) / _LOGO_H, 4)] for left, top, right, bottom in boxes)
 
 
+_SUB_W, _SUB_H, _SUB_ROWS = 320, 180, 45
+# The lower half of the frame is scanned as _SUB_ROWS rows; rows above 60 % of the height are ignored.
+_SUB_TOP = 0.5
+_SUB_FIRST_ROW = 9
+# One sample a second up to an hour of video, sparser beyond.
+_SUB_SAMPLES = 3600
+# A shot or segment with subtitles on screen for more than this share of its time counts as subtitled.
+SUBTITLE_SHARE = 0.3
+NO_SUBTITLES = {"box": None, "spans": [], "share": 0.0}
+
+
+def _text_runs(profile: bytes, threshold: int = 12) -> list[tuple[int, int]]:
+    """Runs of rows dense with edges in one sample. A text line is 3-16 rows high (2-18 % of the frame); thinner
+    runs are picture borders, taller ones busy picture."""
+    runs, start = [], None
+    for row in range(_SUB_FIRST_ROW, _SUB_ROWS + 1):
+        busy = row < _SUB_ROWS and profile[row] >= threshold
+        if busy and start is None:
+            start = row
+        elif not busy and start is not None:
+            if 3 <= row - start <= 16:
+                runs.append((start, row))
+            start = None
+    return runs
+
+
+def detect_subtitles(path: Path, duration: float) -> dict:
+    """Band of burned-in subtitles in the lower part of the frame, and when they are on screen.
+
+    Every sample is edge-detected and averaged per row, so a line of text shows as a short run of rows dense with
+    edges. Subtitles come back to the same rows all through the video while picture detail moves from shot to shot,
+    so rows hit far more often than the typical row form the band. Tuned on 2 videos with Vietnamese/English
+    subtitles and 3 without (archive film, TV news, documentary with a lower-edge border line).
+
+    Returns {"box": [x, y, w, h] fractions or None, "spans": [[start, end], ...] seconds, "share": share of samples}.
+    """
+    fps = min(1.0, _SUB_SAMPLES / max(1.0, duration))
+    lower = int(_SUB_H * (1 - _SUB_TOP))
+    process = subprocess.run(
+        ["ffmpeg", "-nostdin", "-v", "error", "-i", str(path), "-vf",
+         f"fps={fps:.5f},scale={_SUB_W}:{_SUB_H},format=gray,crop={_SUB_W}:{lower}:0:{_SUB_H - lower},"
+         f"edgedetect=low=0.15:high=0.35,scale=1:{_SUB_ROWS}:flags=area", "-f", "rawvideo", "-"],
+        capture_output=True, timeout=900, creationflags=subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0)
+    samples = [process.stdout[offset:offset + _SUB_ROWS]
+               for offset in range(0, len(process.stdout) - _SUB_ROWS + 1, _SUB_ROWS)]
+    if len(samples) < 10:
+        return dict(NO_SUBTITLES)
+    runs = [_text_runs(sample) for sample in samples]
+    hits = [0] * _SUB_ROWS
+    for found in runs:
+        for start, end in found:
+            for row in range(start, end):
+                hits[row] += 1
+    shares = [count / len(samples) for count in hits]
+    need = max(0.08, 3 * statistics.median(shares[_SUB_FIRST_ROW:]))
+    band = [row for row in range(_SUB_FIRST_ROW, _SUB_ROWS) if shares[row] >= need]
+    if not band or band[-1] - band[0] + 1 < 3:
+        return dict(NO_SUBTITLES)
+    top, bottom = band[0], band[-1] + 1
+    shown = [index for index, found in enumerate(runs) if any(min(end, bottom) - max(start, top) >= 2
+                                                               for start, end in found)]
+    step, spans = 1 / fps, []
+    for index in shown:
+        moment = index * step
+        if spans and moment - spans[-1][1] <= 2.5 * step:
+            spans[-1][1] = moment
+        else:
+            spans.append([moment, moment])
+    # A line may appear between two samples: each span is widened by one sample interval.
+    spans = [[round(max(0.0, start - step), 2), round(min(duration, end + step), 2)] for start, end in spans]
+    row = (1 - _SUB_TOP) / _SUB_ROWS
+    y_top, y_bottom = max(0.0, _SUB_TOP + (top - 1) * row), min(1.0, _SUB_TOP + (bottom + 1) * row)
+    return {"box": [0.0, round(y_top, 4), 1.0, round(y_bottom - y_top, 4)], "spans": spans,
+            "share": round(len(shown) / len(samples), 3)}
+
+
+def subtitle_share(source: dict, start: float, end: float) -> float:
+    """Share of start..end with subtitles on screen (0 when there is no subtitle band or no detected timing)."""
+    subtitles = source.get("subtitles") or {}
+    if not subtitles.get("box"):
+        return 0.0
+    covered = sum(max(0.0, min(end, span_end) - max(start, span_start))
+                  for span_start, span_end in subtitles.get("spans") or [])
+    return min(1.0, covered / max(0.1, end - start))
+
+
+def subtitled_shots(source: dict) -> set[int]:
+    return {index for index, shot in enumerate(source.get("shots") or [])
+            if subtitle_share(source, shot["start"], shot["end"]) > SUBTITLE_SHARE}
+
+
+def refresh_subtitle_marks(state: dict) -> None:
+    """Recompute each scene segment's subtitle share after the subtitle band changed."""
+    source = state.get("clip_source") or {}
+    for scene in state.get("scenes") or []:
+        clip = scene.get("clip")
+        if clip and "start" in clip:
+            clip["subs"] = round(subtitle_share(source, clip["start"], clip["end"]), 2)
+
+
 def prepare_source(video_id: str, thumbs_directory: Path, progress=None) -> dict:
-    """Everything the scene step needs about the source video: metadata, shots with thumbnails, logo regions."""
+    """Everything the scene step needs about the source video: metadata, shots with thumbnails, logo regions and
+    the burned-in subtitle band."""
     def report(text: str, percent: int) -> None:
         if progress:
             progress(text, percent)
@@ -567,7 +685,7 @@ def prepare_source(video_id: str, thumbs_directory: Path, progress=None) -> dict
     check_cancelled()
 
     def shots_with_frames() -> list[dict]:
-        report("Tách shot (song song dò logo/watermark)", 45)
+        report("Tách shot (song song dò logo/watermark và phụ đề)", 45)
         found = detect_shots(path, source["duration"])
         if not found:
             raise ClipError("Không tách được shot nào đủ dài từ video này.")
@@ -576,14 +694,19 @@ def prepare_source(video_id: str, thumbs_directory: Path, progress=None) -> dict
         shot_thumbnails(path, found, thumbs_directory, video_id)
         return found
 
-    # Both read the whole 360p copy; the logo scan runs alongside the shot split and frames.
+    # All read the whole 360p copy; the logo and subtitle scans run alongside the shot split and frames.
     started = time.monotonic()
-    shots, logos = run_parallel(lambda task: task(), [shots_with_frames,
-                                                      lambda: detect_logos(path, source["duration"])], 2)
+    shots, logos, subtitles = run_parallel(lambda task: task(), [
+        shots_with_frames, lambda: detect_logos(path, source["duration"]),
+        lambda: detect_subtitles(path, source["duration"])], 3)
     logger.info("clip_logos count=%d boxes=%s", len(logos), logos)
+    logger.info("clip_subtitles box=%s share=%.2f spans=%d", subtitles["box"], subtitles["share"],
+                len(subtitles["spans"]))
     logger.info("clip_prepare_analysis took=%.1fs", time.monotonic() - started)
-    report(f"Xong: {len(shots)} shot, {len(logos)} vùng logo", 100)
-    return {**source, "shots": shots, "logos": logos, "logos_from": "auto"}
+    found = f", phụ đề ở {round(100 * subtitles['share'])}% thời lượng" if subtitles["box"] else ""
+    report(f"Xong: {len(shots)} shot, {len(logos)} vùng logo{found}", 100)
+    return {**source, "shots": shots, "logos": logos, "logos_from": "auto",
+            "subtitles": {**subtitles, "from": "auto"}}
 
 
 # ---------- matching shots to scenes ----------
@@ -686,22 +809,25 @@ _ASSIGN_SCHEMA = {
 WEAK_MATCH_WARNING = "AI không ghép được phần lớn cảnh; đã xếp shot theo thứ tự video — nên kiểm tra từng cảnh."
 
 
-def assign_shots(provider: BaseAIProvider, scenes: list[dict], shots: list[dict], total_seconds: float) -> tuple[list[int | None], list[str]]:
+def assign_shots(provider: BaseAIProvider, scenes: list[dict], shots: list[dict], total_seconds: float,
+                 subtitled: set[int] = frozenset()) -> tuple[list[int | None], list[str]]:
     """Shot index for each scene (None = no shot fits, the scene uses a picture); plus warnings for the user.
 
     The AI chooses by meaning; the code then enforces one scene per shot and fills gaps in story order.
+    `subtitled` shots (burned-in subtitles) are marked for the AI and filled in last.
     """
     lengths = scene_seconds(scenes, total_seconds)
     scene_lines = "\n".join(f"{index}. ({length:.0f}s) {scene['text'][:300]}"
                             for index, (scene, length) in enumerate(zip(scenes, lengths), 1))
-    shot_lines = "\n".join(f"{index}. [bắt đầu {shot['start']:.0f}s] {shot.get('desc') or '(không rõ)'}"
-                           for index, shot in enumerate(shots, 1))
+    shot_lines = "\n".join(f"{index}. [bắt đầu {shot['start']:.0f}s]{' [có phụ đề]' if index - 1 in subtitled else ''} "
+                           f"{shot.get('desc') or '(không rõ)'}" for index, shot in enumerate(shots, 1))
     system = """Bạn là dựng phim cho video kiến thức dạng dọc. Mỗi cảnh (lời đọc) sẽ dùng 1 ĐOẠN LIỀN của video nguồn,
 bắt đầu từ shot bạn chọn và chạy tiếp đủ số giây của cảnh (qua các shot liền sau nó).
 - Chọn shot bắt đầu có hình ảnh khớp nhất với nội dung lời đọc của cảnh.
 - Mỗi shot chỉ làm điểm bắt đầu cho 1 cảnh; các đoạn không nên chồng lên nhau, nên chọn shot bắt đầu cách xa nhau
   đủ số giây. Ưu tiên giữ thứ tự thời gian của shot giống thứ tự cảnh khi có thể.
 - Tránh shot chỉ có chữ, logo, màn hình tiêu đề hoặc người dẫn nói trước camera.
+- Shot ghi [có phụ đề] có dòng phụ đề của video gốc (sẽ bị làm mờ): chỉ chọn khi không có shot nào khác hợp với cảnh.
 - Nếu không có shot nào hợp với cảnh, trả "shot": 0.
 - Chỉ trả về JSON đúng schema, không giải thích.
 Schema: {"assignments": [{"scene": 1, "shot": 12}]}"""
@@ -735,7 +861,10 @@ Schema: {"assignments": [{"scene": 1, "shot": 12}]}"""
         free = [shot for shot in range(len(shots)) if shot not in used]
         if not free:
             break
-        pick = next((shot for shot in free if shot > after), free[0])
+        # Story order first, but a clean shot anywhere beats a subtitled one.
+        clean = [shot for shot in free if shot not in subtitled]
+        pick = next((shot for shot in clean if shot > after), clean[0] if clean else
+                    next((shot for shot in free if shot > after), free[0]))
         chosen[index] = pick
         used.add(pick)
     missing = [str(index + 1) for index, shot in enumerate(chosen) if shot is None]
@@ -760,9 +889,10 @@ def segment_from(source: dict, shot_index: int, need: float) -> dict:
     """The continuous part of the source a scene uses: from the start of a shot, `need` seconds long
     (shorter only at the very end of the video)."""
     shot = source["shots"][shot_index]
-    start = shot["start"]
-    end = min(source["duration"] - 0.2, start + need)
-    return {"shot": shot_index, "thumb": shot["thumb"], "start": round(start, 3), "end": round(max(start + 0.5, end), 3)}
+    start = round(shot["start"], 3)
+    end = round(max(start + 0.5, min(source["duration"] - 0.2, start + need)), 3)
+    return {"shot": shot_index, "thumb": shot["thumb"], "start": start, "end": end,
+            "subs": round(subtitle_share(source, start, end), 2)}
 
 
 def overlapping(clips: list[dict | None], index: int) -> list[int]:
@@ -774,38 +904,57 @@ def overlapping(clips: list[dict | None], index: int) -> list[int]:
             and clip["start"] < item["end"] and item["start"] < clip["end"]]
 
 
+# A segment full of subtitles moves this many shots forward at most to find a clean one (nearby shots usually
+# show the same thing).
+SUBTITLE_DETOUR_SHOTS = 3
+
+
 def plan_segments(source: dict, chosen: list[int | None], needs: list[float]) -> tuple[list[dict | None], list[str]]:
     """Turn the chosen start shots into non-overlapping continuous segments.
 
     A segment that would overlap one already placed starts at the next shot that leaves room (searching forward,
-    then from the beginning); when the video is too short for it the scene uses a picture.
+    then from the beginning); when the video is too short for it the scene uses a picture. A segment with subtitles
+    on screen most of the time starts a few shots later when that one is clean.
     """
-    shots, placed, clips, moved, missing = source["shots"], [], [], [], []
+    shots, placed, clips, moved, missing, cleaned = source["shots"], [], [], [], [], []
+
+    def usable(segment: dict, need: float) -> bool:
+        # Too close to the end, the clip would have to be slowed down beyond MAX_SLOWDOWN.
+        return ((segment["end"] - segment["start"]) * MAX_SLOWDOWN >= need - SEGMENT_MARGIN
+                and not any(segment["start"] < end and start < segment["end"] for start, end in placed))
+
     for index, pick in enumerate(chosen):
         if pick is None:
             clips.append(None)
             continue
         found = None
-        for candidate in list(range(pick, len(shots))) + list(range(0, pick)):
+        for position, candidate in enumerate(list(range(pick, len(shots))) + list(range(0, pick))):
+            if found is not None and position > SUBTITLE_DETOUR_SHOTS:
+                break
             segment = segment_from(source, candidate, needs[index])
-            # Too close to the end: the clip would have to be slowed down beyond MAX_SLOWDOWN.
-            if (segment["end"] - segment["start"]) * MAX_SLOWDOWN < needs[index] - SEGMENT_MARGIN:
+            if not usable(segment, needs[index]):
                 continue
-            if any(segment["start"] < end and start < segment["end"] for start, end in placed):
-                continue
-            found = segment
-            break
+            if segment["subs"] <= SUBTITLE_SHARE:
+                found = segment
+                break
+            found = found or segment
         if found is None:
             missing.append(str(index + 1))
             clips.append(None)
             continue
         if found["shot"] != pick:
-            moved.append(str(index + 1))
+            # The AI's own segment was free: the move only skipped its subtitles.
+            (cleaned if usable(segment_from(source, pick, needs[index]), needs[index]) else moved).append(str(index + 1))
         placed.append((found["start"], found["end"]))
         clips.append(found)
     warnings = []
     if moved:
         warnings.append(f"Cảnh {', '.join(moved)}: đoạn AI chọn trùng với cảnh khác, đã dời sang đoạn trống gần nhất.")
+    if cleaned:
+        warnings.append(f"Cảnh {', '.join(cleaned)}: đoạn AI chọn có phụ đề gốc, đã dời sang đoạn không phụ đề gần đó.")
+    subtitled = [str(index + 1) for index, clip in enumerate(clips) if clip and clip["subs"] > 0]
+    if subtitled:
+        warnings.append(f"Cảnh {', '.join(subtitled)}: có phụ đề của video gốc, phần phụ đề sẽ được làm mờ.")
     if missing:
         warnings.append(f"Cảnh {', '.join(missing)}: video nguồn không còn đoạn trống đủ dài, sẽ dùng ảnh thay. "
                         "Chọn video nguồn dài hơn hoặc giảm số cảnh.")
@@ -818,7 +967,7 @@ def plan_segments(source: dict, chosen: list[int | None], needs: list[float]) ->
 def assign_segments(provider: BaseAIProvider, scenes: list[dict], source: dict,
                     total_seconds: float) -> tuple[list[dict | None], list[str]]:
     """AI picks the start shot of each scene by meaning; the code lays out continuous segments."""
-    chosen, warnings = assign_shots(provider, scenes, source["shots"], total_seconds)
+    chosen, warnings = assign_shots(provider, scenes, source["shots"], total_seconds, subtitled_shots(source))
     clips, more = plan_segments(source, chosen, segment_needs(scenes, total_seconds))
     return clips, warnings + more
 
@@ -851,25 +1000,54 @@ def crop_plan(width: int, height: int, target_w: int, target_h: int,
     if window:
         return window, []
     window = (centre[0], centre[1], crop_w, crop_h)
-    inside = []
-    for x, y, w, h in boxes:
-        if not _overlaps((x, y, w, h), window):
-            continue
-        left, top = max(x, window[0]) - window[0], max(y, window[1]) - window[1]
-        right, bottom = min(x + w, window[0] + crop_w) - window[0], min(y + h, window[1] + crop_h) - window[1]
-        if right - left >= 4 and bottom - top >= 4:
-            inside.append((left // 2 * 2, top // 2 * 2, (right - left) // 2 * 2, (bottom - top) // 2 * 2))
+    inside = [part for part in (_inside(box, window) for box in boxes) if part]
     return window, inside
 
 
+def _inside(box: tuple[int, int, int, int], window: tuple[int, int, int, int]) -> tuple[int, int, int, int] | None:
+    """The part of a box (pixels) inside the crop window, in window coordinates; None when (almost) outside."""
+    x, y, w, h = box
+    wx, wy, ww, wh = window
+    left, top = max(x, wx) - wx, max(y, wy) - wy
+    right, bottom = min(x + w, wx + ww) - wx, min(y + h, wy + wh) - wy
+    if right - left < 4 or bottom - top < 4:
+        return None
+    return left // 2 * 2, top // 2 * 2, (right - left) // 2 * 2, (bottom - top) // 2 * 2
+
+
+def subtitle_blur(source: dict, span: dict, width: int, height: int,
+                  window: tuple[int, int, int, int]) -> tuple[int, int, int, int, str] | None:
+    """Blur box for the subtitle band in a clip cut from span {"start", "end"}: the band inside the crop window, and
+    when to blur in clip time ("" = all along: a band marked by hand has no timing). None when nothing to blur."""
+    subtitles = source.get("subtitles") or {}
+    box = subtitles.get("box")
+    if not box:
+        return None
+    x, y, w, h = box
+    part = _inside((int(x * width), int(y * height), math.ceil(w * width), math.ceil(h * height)), window)
+    if not part:
+        return None
+    spans = subtitles.get("spans") or []
+    if not spans:
+        return (*part, "")
+    times = [(max(0.0, start - span["start"]), min(end, span["end"]) - span["start"])
+             for start, end in spans if start < span["end"] and end > span["start"]]
+    if not times:
+        return None
+    return (*part, "+".join(f"between(t,{start:.2f},{end:.2f})" for start, end in times))
+
+
 def _clip_filter(window, blurs, target_w: int, target_h: int, slowdown: float) -> str:
+    """Crop to the window, blur the boxes (x, y, w, h[, enable expression]) and scale; t starts at 0 for the
+    enable expressions."""
     x, y, w, h = window
-    chain = [f"[0:v]crop={w}:{h}:{x}:{y},setsar=1[c0]"]
+    chain = [f"[0:v]setpts=PTS-STARTPTS,crop={w}:{h}:{x}:{y},setsar=1[c0]"]
     label = "c0"
-    for index, (bx, by, bw, bh) in enumerate(blurs):
+    for index, (bx, by, bw, bh, *when) in enumerate(blurs):
+        enable = f":enable='{when[0]}'" if when and when[0] else ""
         chain.append(f"[{label}]split[b{index}a][b{index}b]")
         chain.append(f"[b{index}b]crop={bw}:{bh}:{bx}:{by},gblur=sigma=18[b{index}c]")
-        chain.append(f"[b{index}a][b{index}c]overlay={bx}:{by}[c{index + 1}]")
+        chain.append(f"[b{index}a][b{index}c]overlay={bx}:{by}{enable}[c{index + 1}]")
         label = f"c{index + 1}"
     chain.append(f"[{label}]scale={target_w}:{target_h}:flags=lanczos,setpts={slowdown:.4f}*PTS,fps=30,"
                  "format=yuv420p[out]")
@@ -878,7 +1056,8 @@ def _clip_filter(window, blurs, target_w: int, target_h: int, slowdown: float) -
 
 def cut_scene_clip(source: dict, shot: dict, needed: float, target_w: int, target_h: int, output: Path) -> dict:
     """Fetch one time range {"start", "end"} in high quality (only that range) and make the scene clip: 9:16, logos
-    avoided or blurred, no sound, slowed down a little when the range is shorter than the scene."""
+    avoided or blurred, subtitles blurred while on screen, no sound, slowed down a little when the range is shorter
+    than the scene."""
     directory = output.parent
     stem = output.stem + "_src"
     for stale in directory.glob(stem + ".*"):
@@ -897,15 +1076,18 @@ def cut_scene_clip(source: dict, shot: dict, needed: float, target_w: int, targe
     raw = downloaded[0]
     try:
         stream = next(item for item in probe(raw)["streams"] if item.get("codec_type") == "video")
-        window, blurs = crop_plan(int(stream["width"]), int(stream["height"]), target_w, target_h, source.get("logos") or [])
+        width, height = int(stream["width"]), int(stream["height"])
+        window, blurs = crop_plan(width, height, target_w, target_h, source.get("logos") or [])
+        band = subtitle_blur(source, shot, width, height, window)
         length = max(0.1, shot["end"] - shot["start"])
         slowdown = min(MAX_SLOWDOWN, max(1.0, needed / length))
         run_media(["ffmpeg", "-y", "-nostdin", "-v", "error", "-i", raw.name, "-filter_complex",
-                   _clip_filter(window, blurs, target_w, target_h, slowdown), "-map", "[out]", "-an",
-                   "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", output.name], directory, 600)
+                   _clip_filter(window, blurs + ([band] if band else []), target_w, target_h, slowdown),
+                   "-map", "[out]", "-an", "-c:v", "libx264", "-preset", "veryfast", "-crf", "18", output.name],
+                  directory, 600)
     finally:
         raw.unlink(missing_ok=True)
-    return {"file": output.name, "blurred": len(blurs), "slowdown": round(slowdown, 2)}
+    return {"file": output.name, "blurred": len(blurs), "subtitles_blurred": bool(band), "slowdown": round(slowdown, 2)}
 
 
 def prepare_render_clips(state: dict, assets: Path, resolution: str, total_seconds: float, progress) -> None:
@@ -924,15 +1106,18 @@ def prepare_render_clips(state: dict, assets: Path, resolution: str, total_secon
         shot = source["shots"][clip["shot"]]
         span = {"start": clip.get("start", shot["start"]), "end": clip.get("end", shot["end"])}
         output = assets / f"scene_{index:02d}_clip_{target_h}.mp4"
-        cut_key = [source["id"], span["start"], span["end"], source.get("logos") or []]
+        subtitles = source.get("subtitles") or {}
+        cut_key = [source["id"], span["start"], span["end"], source.get("logos") or [],
+                   subtitles.get("box"), subtitles.get("spans") or []]
         # Reused when the same range was already cut the same way (e.g. re-rendering with another template).
         if not (clip.get("file") == output.name and clip.get("cut_key") == cut_key and output.is_file()):
             clip.pop("file", None)
             started = time.monotonic()
             result = cut_scene_clip(source, span, needs[index], target_w, target_h, output)
             clip.update({**result, "cut_key": cut_key})
-            logger.info("scene_clip index=%d range=%.1f-%.1fs took=%.1fs blurred=%d", index, span["start"],
-                        span["end"], time.monotonic() - started, result["blurred"])
+            logger.info("scene_clip index=%d range=%.1f-%.1fs took=%.1fs blurred=%d subtitles=%s", index,
+                        span["start"], span["end"], time.monotonic() - started, result["blurred"],
+                        result["subtitles_blurred"])
         finished.append(index)
         progress("prepare_clips", round(2 + 8 * len(finished) / max(1, len(todo))))
 

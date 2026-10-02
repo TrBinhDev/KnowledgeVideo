@@ -334,7 +334,7 @@ class ClipPage(QWidget):
         def found(candidates: list[dict]) -> None:
             # Results of every search so far stay in the list, best first.
             merged = {item["id"]: item for item in (self.state.get("clip_candidates") or []) + candidates}
-            self.state["clip_candidates"] = sorted(merged.values(), key=lambda item: (not item["allowed"], -item["score"]))
+            self.state["clip_candidates"] = sorted(merged.values(), key=clips.candidate_order)
             self.window._save()
             self._fill_candidates()
             best = clips.best_candidate(self.state["clip_candidates"])

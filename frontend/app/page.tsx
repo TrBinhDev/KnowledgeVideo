@@ -130,6 +130,116 @@ const settingFields: [string, string, string][] = [
   ["KV_HTTP_USER_AGENT", "Wikimedia User-Agent", "text"], ["KV_VIDEO_FONT", "Font trên video", "text"],
 ];
 
+/** [x, y, w, h] as fractions of the source frame. */
+type Box = number[];
+type RegionTarget = { kind: "logo" | "sub"; index: number };
+/** `box` is the region before the drag (for a new region: the one it replaces, or null). */
+interface RegionDrag { mode: "draw" | "move" | "resize"; target: RegionTarget; origin: number[]; box: Box | null; corner: string }
+const clamp01 = (value: number) => Math.min(1, Math.max(0, value));
+// Same rule as core/clips.py subtitle_share: share of start..end with detected subtitles on screen.
+function subtitleShare(subtitles: Data | undefined, start: number, end: number) {
+  if (!subtitles?.box) return 0;
+  const covered = (subtitles.spans || []).reduce((sum: number, [a, b]: number[]) => sum + Math.max(0, Math.min(end, b) - Math.max(start, a)), 0);
+  return Math.min(1, covered / Math.max(0.1, end - start));
+}
+
+/** Logo and subtitle regions drawn and adjusted with the mouse on frames of the source video. */
+function RegionEditor({ frames, logos, subtitle, onChange }: {
+  frames: { path: string; label: string; subtitled: boolean }[];
+  logos: Box[]; subtitle: Box | null;
+  onChange: (logos: Box[], subtitle: Box | null) => void;
+}) {
+  const [frame, setFrame] = useState(0);
+  const [tool, setTool] = useState<"logo" | "sub">("logo");
+  const area = useRef<HTMLDivElement>(null);
+  const drag = useRef<RegionDrag | null>(null);
+  const latest = useRef({ logos, subtitle });
+  latest.current = { logos, subtitle };
+  const current = frames[Math.min(frame, frames.length - 1)];
+  const point = (event: React.PointerEvent) => {
+    const rect = area.current!.getBoundingClientRect();
+    return [clamp01((event.clientX - rect.left) / rect.width), clamp01((event.clientY - rect.top) / rect.height)];
+  };
+  const put = (target: RegionTarget, box: Box | null) => {
+    const { logos: now, subtitle: sub } = latest.current;
+    const next = target.kind === "sub" ? { logos: now, subtitle: box } : {
+      logos: box ? now.map((item, i) => i === target.index ? box : item).concat(target.index >= now.length ? [box] : [])
+        : now.filter((_, i) => i !== target.index),
+      subtitle: sub,
+    };
+    // Pointer events can arrive before React renders again: keep the newest regions here too.
+    latest.current = next;
+    onChange(next.logos, next.subtitle);
+  };
+  const begin = (event: React.PointerEvent, mode: RegionDrag["mode"], target: RegionTarget, box: Box | null, corner = "") => {
+    if (event.button !== 0) return;
+    event.preventDefault(); event.stopPropagation();
+    area.current?.setPointerCapture(event.pointerId);
+    drag.current = { mode, target, origin: point(event), box, corner };
+  };
+  const draw = (event: React.PointerEvent) => {
+    const [x, y] = point(event);
+    const target: RegionTarget = tool === "sub" ? { kind: "sub", index: 0 } : { kind: "logo", index: latest.current.logos.length };
+    begin(event, "draw", target, target.kind === "sub" ? latest.current.subtitle : null);
+    put(target, [x, y, 0, 0]);
+  };
+  const move = (event: React.PointerEvent) => {
+    const active = drag.current;
+    if (!active) return;
+    const [px, py] = point(event);
+    const [ox, oy] = active.origin;
+    const [x, y, w, h] = active.box || [ox, oy, 0, 0];
+    let next: Box;
+    if (active.mode === "draw") next = [Math.min(ox, px), Math.min(oy, py), Math.abs(px - ox), Math.abs(py - oy)];
+    else if (active.mode === "move") next = [clamp01(Math.min(1 - w, x + px - ox)), clamp01(Math.min(1 - h, y + py - oy)), w, h];
+    else {
+      let [left, top, right, bottom] = [x, y, x + w, y + h];
+      if (active.corner.includes("w")) left = px; else right = px;
+      if (active.corner.includes("n")) top = py; else bottom = py;
+      next = [Math.min(left, right), Math.min(top, bottom), Math.abs(right - left), Math.abs(bottom - top)];
+    }
+    put(active.target, next.map(value => Math.round(value * 10000) / 10000));
+  };
+  const end = () => {
+    const active = drag.current;
+    drag.current = null;
+    if (!active) return;
+    const { logos: now, subtitle: sub } = latest.current;
+    const box = active.target.kind === "sub" ? sub : now[active.target.index];
+    // A click without dragging changes nothing: a new region is dropped (the subtitle band it replaced comes back),
+    // a region squashed flat returns to its size before the drag.
+    if (box && (box[2] < 0.01 || box[3] < 0.01)) put(active.target, active.box);
+  };
+  const regions: { target: RegionTarget; box: Box; label: string }[] = [
+    ...logos.map((box, index) => ({ target: { kind: "logo" as const, index }, box, label: `Logo ${index + 1}` })),
+    ...(subtitle ? [{ target: { kind: "sub" as const, index: 0 }, box: subtitle, label: "Phụ đề" }] : []),
+  ];
+  const nextSubtitled = frames.findIndex((item, i) => i > frame && item.subtitled);
+  return <div className="region-editor">
+    <div className="region-toolbar">
+      <span>Khoanh vùng mới:</span>
+      <Pill active={tool === "logo"} onClick={() => setTool("logo")}>Logo / watermark</Pill>
+      <Pill active={tool === "sub"} onClick={() => setTool("sub")}>Phụ đề</Pill>
+    </div>
+    <div ref={area} className={`region-area tool-${tool}`} onPointerDown={draw} onPointerMove={move} onPointerUp={end} onPointerCancel={end}>
+      <LocalMedia path={current?.path} className="region-image"/>
+      {regions.map(({ target, box, label }) => <div key={`${target.kind}${target.index}`} className={`region-box ${target.kind}`}
+        style={{ left: `${box[0] * 100}%`, top: `${box[1] * 100}%`, width: `${box[2] * 100}%`, height: `${box[3] * 100}%` }}
+        onPointerDown={event => begin(event, "move", target, box)}>
+        <span className="region-label">{label}</span>
+        <button type="button" className="region-remove" aria-label={`Xóa ${label}`} onPointerDown={event => event.stopPropagation()} onClick={() => put(target, null)}>×</button>
+        {["nw", "ne", "sw", "se"].map(corner => <i key={corner} className={`region-handle ${corner}`} onPointerDown={event => begin(event, "resize", target, box, corner)}/>)}
+      </div>)}
+    </div>
+    <div className="region-frames">
+      <button type="button" className="secondary small" disabled={frame <= 0} onClick={() => setFrame(frame - 1)}>‹</button>
+      <span>{current ? current.label : "Chưa có khung hình"}</span>
+      <button type="button" className="secondary small" disabled={frame >= frames.length - 1} onClick={() => setFrame(frame + 1)}>›</button>
+      {nextSubtitled >= 0 && <button type="button" className="secondary small" onClick={() => setFrame(nextSubtitled)}>Shot có phụ đề tiếp theo</button>}
+    </div>
+  </div>;
+}
+
 export default function Home() {
   const [tab, setTab] = useState<Tab>("create");
   const [kind, setKind] = useState<Kind | null>(null);
@@ -156,6 +266,40 @@ export default function Home() {
   const [logOpen, setLogOpen] = useState(false);
   const logCounter = useRef(0);
   const logEnd = useRef<HTMLDivElement>(null);
+  const logPanel = useRef<HTMLElement>(null);
+  // Where the log panel was dragged to (top-left corner); null keeps its default bottom-right spot.
+  const [logPos, setLogPos] = useState<{ x: number; y: number } | null>(null);
+  const placeLog = useCallback((x: number, y: number) => {
+    const box = logPanel.current?.getBoundingClientRect();
+    if (!box) return;
+    setLogPos({ x: Math.min(Math.max(0, x), window.innerWidth - box.width), y: Math.min(Math.max(0, y), window.innerHeight - box.height) });
+  }, []);
+  const dragLog = (event: React.PointerEvent<HTMLElement>) => {
+    if (event.button !== 0 || (event.target as HTMLElement).closest("button") || !logPanel.current) return;
+    event.preventDefault();
+    const box = logPanel.current.getBoundingClientRect();
+    const dx = event.clientX - box.left, dy = event.clientY - box.top;
+    const header = event.currentTarget;
+    header.setPointerCapture(event.pointerId);
+    header.classList.add("dragging");
+    const move = (e: PointerEvent) => placeLog(e.clientX - dx, e.clientY - dy);
+    const stop = () => {
+      header.classList.remove("dragging");
+      header.removeEventListener("pointermove", move);
+      header.removeEventListener("pointerup", stop);
+      header.removeEventListener("pointercancel", stop);
+    };
+    header.addEventListener("pointermove", move);
+    header.addEventListener("pointerup", stop);
+    header.addEventListener("pointercancel", stop);
+  };
+  // Keep a dragged panel inside the window when the window gets smaller.
+  useEffect(() => {
+    if (!logPos || !logOpen) return;
+    const keep = () => placeLog(logPos.x, logPos.y);
+    window.addEventListener("resize", keep);
+    return () => window.removeEventListener("resize", keep);
+  }, [logPos, logOpen, placeLog]);
   const [topics, setTopics] = useState<Data[]>([]);
   const [inputType, setInputType] = useState<"keywords" | "source_ai" | "source_verbatim" | "json">("keywords");
   const [selectedScene, setSelectedScene] = useState(0);
@@ -391,15 +535,24 @@ export default function Home() {
     await window.kv!.copyText(result.text);
     setNotice("Đã sao chép ghi nguồn clip.");
   });
-  const changeLogo = (index: number, axis: number, value: number) => {
-    const logos = (state.clip_source?.logos || []).map((box: number[]) => [...box]);
-    logos[index][axis] = Math.max(0, Math.min(1, value));
-    patch({ clip_source: { ...state.clip_source, logos } });
-  };
-  const saveLogos = () => work("Lưu vùng logo", async () => {
+  const setRegions = (logos: Box[], subtitle: Box | null) => patch({ clip_source: { ...state.clip_source, logos,
+    subtitles: { ...(state.clip_source?.subtitles || { spans: [], share: 0 }), box: subtitle } } });
+  const saveLogos = () => work("Lưu vùng che", async () => {
     const saved = await save(state);
-    await operate("set_logos", saved.state, { logos: state.clip_source?.logos || [] });
+    await operate("set_logos", saved.state, { logos: state.clip_source?.logos || [], subtitles: state.clip_source?.subtitles?.box || null });
   });
+  const regionFrames = (state.clip_source?.shots || []).map((shot: Data, i: number) => {
+    const subtitled = subtitleShare(state.clip_source?.subtitles, shot.start, shot.end) > 0.3;
+    return { path: `${directory}/assets/clip_shots/${shot.thumb}`, subtitled,
+      label: `Shot ${i + 1}/${state.clip_source.shots.length} · ${Math.round(shot.start || 0)}s${subtitled ? " · có phụ đề" : ""}` };
+  });
+  const subtitleInfo = (() => {
+    const subtitles = state.clip_source?.subtitles;
+    if (!subtitles) return "Video này được phân tích trước khi có tính năng dò phụ đề: hãy khoanh vùng phụ đề bằng tay nếu có.";
+    if (subtitles.box && subtitles.spans?.length) return `Tự dò thấy phụ đề ở khoảng ${Math.round((subtitles.share || 0) * 100)}% thời lượng; vùng phụ đề chỉ bị làm mờ lúc có chữ.`;
+    if (subtitles.box) return "Vùng phụ đề khoanh bằng tay được làm mờ suốt cả cảnh.";
+    return "Không dò thấy phụ đề. Nếu có, chọn \"Phụ đề\" rồi kéo trên ảnh để khoanh.";
+  })();
   const useTemplate = (key: string, transition?: string) => { patchRender(transition ? { template: key, transition } : { template: key }); setPreviewPath(""); setKind(previous => previous || "image"); setMode(previous => previous || "auto"); setTab("create"); setStepIndex(kind && mode ? stepsFor(kind, mode).findIndex(item => item.key === "look") : 0); };
   const scene = state.scenes?.[selectedScene] || {};
   const scenePath = (item: Data) => item.clip?.thumb ? `${directory}/assets/clip_shots/${item.clip.thumb}` : item.image?.file ? `${directory}/assets/${item.image.file}` : "";
@@ -449,17 +602,17 @@ export default function Home() {
               </div></Card>
             </div><aside className="context-panel"><div className="context-icon"><Icon name={kind} size={22}/></div><h3>{kind === "image" ? "Video ảnh" : "Video clip"}</h3><p>{kind === "image" ? "Ảnh sẽ được chuẩn bị cho từng cảnh sau khi kịch bản hoàn tất." : "Bạn có thể dán link YouTube hoặc để ứng dụng tìm video nguồn."}</p><div className="context-rule"/><span>QUY TRÌNH</span><strong>{mode === "auto" ? "Tự động" : "Thủ công"}</strong><span>SỐ BƯỚC</span><strong>{steps.length} bước</strong></aside></div>}
             {step === "topic" && <div className="stack"><Card title="Chọn góc kể" description="AI đã gợi ý từ nội dung bạn nhập. Bạn có thể chọn hoặc sửa lại."><div className="topic-grid">{topics.map((item, i) => <button key={i} className={`topic-card ${state.topic === item.title ? "selected" : ""}`} onClick={() => patch({ topic: item.title })}><span>0{i + 1}</span><h3>{item.title}</h3><p>{item.angle}</p></button>)}</div><Field label="Chủ đề cuối cùng"><input value={state.topic || ""} onChange={e => patch({ topic: e.target.value })}/></Field></Card></div>}
-            {step === "script" && <div className="stack"><Card title="Đề cương" description="Duyệt các ý chính trước khi tạo lời đọc.">{state.outline?.points?.length ? <div className="outline-list">{state.outline.points.map((point: Data, i: number) => <div key={i}><span>{String(i + 1).padStart(2, "0")}</span><p>{point.text}</p><em>{point.seconds}s</em></div>)}</div> : <p className="muted">Kịch bản này không có đề cương riêng.</p>}<div className="outline-edit"><Field label={"Ch\u1ec9nh \u0111\u1ec1 c\u01b0\u01a1ng (m\u1ed7i d\u00f2ng: 20s | \u00fd ch\u00ednh)"}><textarea rows={6} value={outlineText} onChange={e => setOutlineText(e.target.value)}/></Field><button className="secondary small" disabled={busy || !state.outline?.points?.length} onClick={saveOutline}>{"L\u01b0u \u0111\u1ec1 c\u01b0\u01a1ng"}</button></div></Card><Card title="Lời đọc" description="Tạo với AI rồi chỉnh từng phần nếu cần."><div className="script-actions"><button className="secondary" disabled={busy || !state.outline?.points?.length} onClick={makeScript}><Icon name="spark" size={17}/> {state.script ? "Viết lại bằng AI" : "Tạo kịch bản bằng AI"}</button>{state.script && <button className="secondary" disabled={busy} onClick={() => work("Đo lại lời đọc", async () => { const saved = await save(state); await operate("fit_script", saved.state); })}><Icon name="volume" size={17}/> Đo lại thời lượng</button>}</div>{state.script && <div className="stack"><Field label="Tiêu đề"><input value={state.script.title || ""} onChange={e => patch({ script: { ...state.script, title: e.target.value } })}/></Field><Field label="Mở đầu"><textarea rows={3} value={state.script.hook || ""} onChange={e => patch({ script: { ...state.script, hook: e.target.value } })}/></Field><Field label="Nội dung"><textarea rows={10} value={state.script.body || ""} onChange={e => patch({ script: { ...state.script, body: e.target.value } })}/></Field><div className="info-line">{state.script.timing?.seconds ? `Lời đọc dự kiến: ${Math.round(state.script.timing.seconds)} giây` : "Đo lại sau khi sửa lời đọc."}</div></div>}</Card></div>}
+            {step === "script" && <div className="stack"><Card title="Đề cương" description="Duyệt các ý chính trước khi tạo lời đọc.">{state.outline?.points?.length ? <div className="outline-list">{state.outline.points.map((point: Data, i: number) => <div key={i}><span>{String(i + 1).padStart(2, "0")}</span><p>{point.text}</p><em>{point.seconds}s</em></div>)}</div> : <p className="muted">Kịch bản này không có đề cương riêng.</p>}<div className="outline-edit"><Field label={"Chỉnh đề cương (mỗi dòng: 20s | ý chính)"}><textarea rows={6} value={outlineText} onChange={e => setOutlineText(e.target.value)}/></Field><button className="secondary small" disabled={busy || !state.outline?.points?.length} onClick={saveOutline}>{"Lưu đề cương"}</button></div></Card><Card title="Lời đọc" description="Tạo với AI rồi chỉnh từng phần nếu cần."><div className="script-actions"><button className="secondary" disabled={busy || !state.outline?.points?.length} onClick={makeScript}><Icon name="spark" size={17}/> {state.script ? "Viết lại bằng AI" : "Tạo kịch bản bằng AI"}</button>{state.script && <button className="secondary" disabled={busy} onClick={() => work("Đo lại lời đọc", async () => { const saved = await save(state); await operate("fit_script", saved.state); })}><Icon name="volume" size={17}/> Đo lại thời lượng</button>}</div>{state.script && <div className="stack"><Field label="Tiêu đề"><input value={state.script.title || ""} onChange={e => patch({ script: { ...state.script, title: e.target.value } })}/></Field><Field label="Mở đầu"><textarea rows={3} value={state.script.hook || ""} onChange={e => patch({ script: { ...state.script, hook: e.target.value } })}/></Field><Field label="Nội dung"><textarea rows={10} value={state.script.body || ""} onChange={e => patch({ script: { ...state.script, body: e.target.value } })}/></Field><div className="info-line">{state.script.timing?.seconds ? `Lời đọc dự kiến: ${Math.round(state.script.timing.seconds)} giây` : "Đo lại sau khi sửa lời đọc."}</div></div>}</Card></div>}
             {step === "source" && <div className="stack"><Card title="Chọn video nguồn" description="Dán link YouTube hoặc để ứng dụng tìm khi tạo video."><div className="form-grid"><Field label="Link YouTube"><input value={state.clip_link || ""} onChange={e => patch({ clip_link: e.target.value })} placeholder="https://www.youtube.com/watch?v=..."/></Field><Field label="Từ khóa tìm kiếm"><input value={state.clip_query || ""} onChange={e => patch({ clip_query: e.target.value })} placeholder="Để trống: tự lấy từ chủ đề"/></Field><Field label="Bộ lọc nội dung"><Select value={state.clip_filter} onChange={v => patch({ clip_filter: v })} options={Object.entries(catalog.clip_filters || { real: "Cảnh quay thực" })}/></Field></div><div className="info-line">Nếu để trống link, ứng dụng sẽ tìm video phù hợp với chủ đề.</div></Card></div>}
-            {step === "scenes" && <div className="stack"><Card title={kind === "image" ? "Ảnh cho từng cảnh" : "Shot cho từng cảnh"} description={`${state.scenes?.length || 0} cảnh từ kịch bản. Chọn một cảnh để xem và chỉnh.`}><div className="scene-toolbar">{kind === "image" ? <button className="secondary" disabled={busy} onClick={() => work("Chuẩn bị ảnh", async () => { const result = await operate("fetch_images", state, { missing_only: true, pollinations: true }); setState(result.state); })}><Icon name="image" size={17}/> Tìm ảnh cho các cảnh</button> : <><button className="secondary" disabled={busy} onClick={() => work("Tìm video nguồn", async () => { const result = await call<Data>("search_clips", { ...ai, query: state.clip_query || state.video_query?.vi || state.topic, filter: state.clip_filter, about: state.topic }); setSourceCandidates(result.candidates || []); })}><Icon name="spark" size={17}/> Tìm video</button><button className="secondary" disabled={busy || !state.clip_source} onClick={() => work("Ghép lại shot", async () => { await operate("reassign_clips"); })}><Icon name="refresh" size={17}/> Ghép lại shot</button></>}</div>{kind === "clip" && <div className="source-inline"><Field label="Link YouTube"><input value={state.clip_link || ""} onChange={e => patch({ clip_link: e.target.value })} placeholder="Dán link video nguồn"/></Field><button className="primary" disabled={busy || !state.clip_link} onClick={() => work("Phân tích video nguồn", async () => { const saved = await save(state); await operate("prepare_clips", saved.state, { video: state.clip_link }); })}>Phân tích video</button></div>}{kind === "clip" && sourceCandidates.length > 0 && <div className="candidate-list">{sourceCandidates.slice(0, 8).map((item, i) => <div key={i} className="candidate"><div><strong>{item.title || item.id}</strong><p>{item.channel || ""} · {item.score ?? ""} điểm</p></div><button className="secondary small" onClick={() => window.kv?.openExternal(`https://www.youtube.com/watch?v=${item.id}`)}><Icon name="link" size={14}/></button><button className="secondary small" disabled={busy || item.allowed === false} onClick={() => work("Phân tích video nguồn", async () => { const saved = await save({ ...state, clip_link: item.id }); await operate("prepare_clips", saved.state, { video: item.id }); })}>Dùng video này</button></div>)}</div>}
-              <div className="scene-grid">{(state.scenes || []).map((item: Data, i: number) => <button key={i} className={`scene-card ${selectedScene === i ? "selected" : ""}`} onClick={() => setSelectedScene(i)}><div className="scene-thumb"><LocalMedia path={scenePath(item)}/><span>{String(i + 1).padStart(2, "0")}</span></div><p>{item.text || `Cảnh ${i + 1}`}</p></button>)}</div></Card>{kind === "clip" && state.clip_source && <Card title={"V\u00f9ng logo / watermark"} description={"Ch\u1ec9nh c\u00e1c v\u00f9ng c\u1ea7n l\u00e0m m\u1edd trong video."}><div className="logo-layout"><div className="logo-preview"><LocalMedia path={state.clip_source.shots?.[0]?.thumb ? `${directory}/assets/clip_shots/${state.clip_source.shots[0].thumb}` : ""}/>{(state.clip_source.logos || []).map((box: number[], i: number) => <span key={i} className="logo-box" style={{left:`${box[0]*100}%`,top:`${box[1]*100}%`,width:`${box[2]*100}%`,height:`${box[3]*100}%`}}/>)}</div><div className="logo-fields">{(state.clip_source.logos || []).map((box: number[], i: number) => <div className="logo-row" key={i}><strong>Logo {i+1}</strong>{box.map((value, axis) => <label key={axis}>{["X","Y","W","H"][axis]}<input type="number" min="0" max="1" step="0.01" value={value} onChange={e => changeLogo(i,axis,Number(e.target.value))}/></label>)}<button className="secondary small" onClick={() => patch({clip_source:{...state.clip_source,logos:state.clip_source.logos.filter((_: number[], n: number) => n!==i)}})}>{"\u00d7"}</button></div>)}<div className="button-row"><button className="secondary small" onClick={() => patch({clip_source:{...state.clip_source,logos:[...(state.clip_source.logos || []),[0.75,0.02,0.2,0.1]]}})}>{"Th\u00eam v\u00f9ng"}</button><button className="secondary small" onClick={() => patch({clip_source:{...state.clip_source,logos:[]}})}>{"Kh\u00f4ng c\u00f3 logo"}</button><button className="primary small" disabled={busy} onClick={saveLogos}>{"L\u01b0u v\u00f9ng logo"}</button></div></div></div></Card>}{state.scenes?.length > 0 && <Card title={`Cảnh ${selectedScene + 1}`} description="Chỉnh nội dung và hình của cảnh đang chọn."><div className="scene-detail"><LocalMedia path={scenePath(scene)} className="detail-media"/><div className="stack"><Field label="Lời đọc của cảnh"><textarea rows={5} value={scene.text || ""} onChange={e => { const scenes = [...state.scenes]; scenes[selectedScene] = { ...scene, text: e.target.value }; patch({ scenes }); }}/></Field><Field label="Từ khóa ảnh"><input value={scene.image_query_vi || ""} onChange={e => { const scenes = [...state.scenes]; scenes[selectedScene] = { ...scene, image_query_vi: e.target.value }; patch({ scenes }); }}/></Field>{kind === "image" ? <div className="button-row"><button className="secondary small" disabled={busy} onClick={() => work("Đổi ảnh", async () => { const saved = await save(state); await operate("replace_image", saved.state, { index: selectedScene, variant: "wikimedia" }); })}>Ảnh khác</button><button className="secondary small" disabled={busy} onClick={() => work("Tạo ảnh AI", async () => { const saved = await save(state); await operate("replace_image", saved.state, { index: selectedScene, variant: "gemini" }); })}>Ảnh AI Gemini</button><button className="secondary small" disabled={busy} onClick={() => work("Pollinations", async () => { const saved = await save(state); await operate("replace_image", saved.state, { index: selectedScene, variant: "pollinations" }); })}>{"\u1ea2nh Pollinations"}</button></div> : <div className="button-row"><button className="secondary small" disabled={busy} onClick={() => work("Dùng ảnh", async () => { await operate("use_picture", state, { index: selectedScene }); })}>Dùng ảnh thay clip</button>{state.clip_source?.shots?.length > 0 && <Select value={scene.clip?.shot ?? ""} onChange={v => work("Chọn shot", async () => { await operate("choose_shot", state, { index: selectedScene, shot: Number(v) }); })} options={state.clip_source.shots.map((shot: Data, i: number) => [String(i), `Shot ${i + 1} · ${Math.round(shot.start || 0)}s`])}/>}</div>}</div></div></Card>}</div>}
+            {step === "scenes" && <div className="stack"><Card title={kind === "image" ? "Ảnh cho từng cảnh" : "Shot cho từng cảnh"} description={`${state.scenes?.length || 0} cảnh từ kịch bản. Chọn một cảnh để xem và chỉnh.`}><div className="scene-toolbar">{kind === "image" ? <button className="secondary" disabled={busy} onClick={() => work("Chuẩn bị ảnh", async () => { const result = await operate("fetch_images", state, { missing_only: true, pollinations: true }); setState(result.state); })}><Icon name="image" size={17}/> Tìm ảnh cho các cảnh</button> : <><button className="secondary" disabled={busy} onClick={() => work("Tìm video nguồn", async () => { const result = await call<Data>("search_clips", { ...ai, query: state.clip_query || state.video_query?.vi || state.topic, filter: state.clip_filter, about: state.topic }); setSourceCandidates(result.candidates || []); })}><Icon name="spark" size={17}/> Tìm video</button><button className="secondary" disabled={busy || !state.clip_source} onClick={() => work("Ghép lại shot", async () => { await operate("reassign_clips"); })}><Icon name="refresh" size={17}/> Ghép lại shot</button></>}</div>{kind === "clip" && <div className="source-inline"><Field label="Link YouTube"><input value={state.clip_link || ""} onChange={e => patch({ clip_link: e.target.value })} placeholder="Dán link video nguồn"/></Field><button className="primary" disabled={busy || !state.clip_link} onClick={() => work("Phân tích video nguồn", async () => { const saved = await save(state); await operate("prepare_clips", saved.state, { video: state.clip_link }); })}>Phân tích video</button></div>}{kind === "clip" && sourceCandidates.length > 0 && <div className="candidate-list">{sourceCandidates.slice(0, 8).map((item, i) => <div key={i} className="candidate"><div><strong>{item.title || item.id}</strong><p>{item.channel || ""} · {item.score ?? ""} điểm{item.subtitles ? " · có phụ đề" : ""}</p></div><button className="secondary small" onClick={() => window.kv?.openExternal(`https://www.youtube.com/watch?v=${item.id}`)}><Icon name="link" size={14}/></button><button className="secondary small" disabled={busy || item.allowed === false} onClick={() => work("Phân tích video nguồn", async () => { const saved = await save({ ...state, clip_link: item.id }); await operate("prepare_clips", saved.state, { video: item.id }); })}>Dùng video này</button></div>)}</div>}
+              <div className="scene-grid">{(state.scenes || []).map((item: Data, i: number) => <button key={i} className={`scene-card ${selectedScene === i ? "selected" : ""}`} onClick={() => setSelectedScene(i)}><div className="scene-thumb"><LocalMedia path={scenePath(item)}/><span>{String(i + 1).padStart(2, "0")}</span>{item.clip?.subs > 0 && <em className="scene-flag" title="Đoạn này có phụ đề của video gốc, sẽ được làm mờ">Phụ đề</em>}</div><p>{item.text || `Cảnh ${i + 1}`}</p></button>)}</div></Card>{kind === "clip" && state.clip_source && <Card title="Vùng che: logo & phụ đề" description="Kéo trên ảnh để khoanh vùng cần làm mờ. Kéo vùng để di chuyển, kéo góc để đổi cỡ, bấm × để xóa."><RegionEditor frames={regionFrames} logos={state.clip_source.logos || []} subtitle={state.clip_source.subtitles?.box || null} onChange={setRegions}/><div className="region-footer"><span className="info-line">{subtitleInfo}</span><div className="button-row"><button className="secondary small" onClick={() => setRegions([], null)}>Xóa tất cả</button><button className="primary small" disabled={busy} onClick={saveLogos}>Lưu vùng che</button></div></div></Card>}{state.scenes?.length > 0 && <Card title={`Cảnh ${selectedScene + 1}`} description="Chỉnh nội dung và hình của cảnh đang chọn."><div className="scene-detail"><LocalMedia path={scenePath(scene)} className="detail-media"/><div className="stack"><Field label="Lời đọc của cảnh"><textarea rows={5} value={scene.text || ""} onChange={e => { const scenes = [...state.scenes]; scenes[selectedScene] = { ...scene, text: e.target.value }; patch({ scenes }); }}/></Field><Field label="Từ khóa ảnh"><input value={scene.image_query_vi || ""} onChange={e => { const scenes = [...state.scenes]; scenes[selectedScene] = { ...scene, image_query_vi: e.target.value }; patch({ scenes }); }}/></Field>{kind === "image" ? <div className="button-row"><button className="secondary small" disabled={busy} onClick={() => work("Đổi ảnh", async () => { const saved = await save(state); await operate("replace_image", saved.state, { index: selectedScene, variant: "wikimedia" }); })}>Ảnh khác</button><button className="secondary small" disabled={busy} onClick={() => work("Tạo ảnh AI", async () => { const saved = await save(state); await operate("replace_image", saved.state, { index: selectedScene, variant: "gemini" }); })}>Ảnh AI Gemini</button><button className="secondary small" disabled={busy} onClick={() => work("Pollinations", async () => { const saved = await save(state); await operate("replace_image", saved.state, { index: selectedScene, variant: "pollinations" }); })}>{"Ảnh Pollinations"}</button></div> : <div className="button-row"><button className="secondary small" disabled={busy} onClick={() => work("Dùng ảnh", async () => { await operate("use_picture", state, { index: selectedScene }); })}>Dùng ảnh thay clip</button>{state.clip_source?.shots?.length > 0 && <Select value={scene.clip?.shot ?? ""} onChange={v => work("Chọn shot", async () => { await operate("choose_shot", state, { index: selectedScene, shot: Number(v) }); })} options={state.clip_source.shots.map((shot: Data, i: number) => [String(i), `Shot ${i + 1} · ${Math.round(shot.start || 0)}s${regionFrames[i]?.subtitled ? " · có phụ đề" : ""}`])}/>}</div>}</div></div></Card>}</div>}
             {step === "look" && <div className="stack"><Card title="Chọn template" description="Chọn bằng thẻ hình. Mẫu sẽ áp dụng cho toàn bộ video."><div className="template-grid">{Object.entries(catalog.templates || { "history-scroll": "Cổ thư", "history-imperial": "Hoàng triều", "history-archive": "Tư liệu" }).map(([key, label]) => <button key={key} className={`template-card ${render.template === key ? "selected" : ""}`} onClick={() => { patchRender({ template: key }); setPreviewPath(""); }}><div className={`template-art ${templateNotes[key]?.[2] || "scroll"}`}>{gallery[key] ? <LocalMedia path={gallery[key]}/> : <><span>CHUYỆN LỊCH SỬ</span><strong>{templateNotes[key]?.[0] || String(label)}</strong><i>01 / 03</i></>}</div><div className="template-card-bottom"><strong>{String(label)}</strong><p>{templateNotes[key]?.[1]}</p></div><span className="template-check"><Icon name="check" size={13}/></span></button>)}</div></Card>
               <Card title="Chuyển cảnh" description="Chọn hiệu ứng theo nhịp kể của video."><div className="effect-grid">{Object.entries(transitionNotes).map(([key, label]) => <button key={key} className={`effect-card ${render.transition === key ? "selected" : ""}`} onClick={() => { patchRender({ transition: key }); setPreviewPath(""); }}><div className={`effect-visual effect-${key}`}><span/><span/></div><strong>{label as string}</strong></button>)}</div></Card>
               <Card title="Chữ trên video" description="Kiểu hiển thị lời đọc, xem thử ngay trên thẻ."><div className="caption-grid">{([ ["highlight", "Chạy theo từng từ", "Một từ sáng lên theo lời đọc"], ["normal", "Phụ đề tĩnh", "Hiện cả câu ở cuối khung hình"], ["off", "Không hiện chữ", "Chỉ giữ hình và giọng đọc"] ] as const).map(([key, title, desc]) => <button key={key} className={`caption-card ${render.subtitle_style === key ? "selected" : ""}`} onClick={() => patchRender({ subtitle_style: key })}><div className="caption-preview">{key !== "off" && <span>Ngày ấy, <b className={key === "highlight" ? "word-active" : ""}>lịch sử</b> đã đổi thay</span>}</div><strong>{title}</strong><p>{desc}</p></button>)}</div></Card>
               <Card title="Xuất video" description="Các lựa chọn kỹ thuật dùng khi dựng MP4."><div className="form-grid"><Field label="Thời gian cảnh"><Select value={render.scene_timing} onChange={v => patchRender({ scene_timing: v })} options={Object.entries(catalog.scene_timings || { sentences: "Theo câu đọc", even: "Chia đều" })}/></Field><Field label="Độ phân giải"><Select value={render.resolution} onChange={v => patchRender({ resolution: v })} options={(catalog.resolutions || ["1080x1920", "720x1280"]).map((v: string) => [v, v])}/></Field><Field label="Nhạc nền"><div className="input-action"><input readOnly value={render.music_source || ""} placeholder="Không dùng nhạc"/><button onClick={() => window.kv?.chooseFile("music").then(v => v && patchRender({ music_source: v }))}><Icon name="folder" size={17}/></button></div></Field><Field label={`Âm lượng nhạc · ${render.music_volume}%`}><input type="range" min="0" max="100" value={render.music_volume} onChange={e => patchRender({ music_volume: Number(e.target.value) })}/></Field></div></Card>
               <Card title="Xem thử" description="Xem chuyển cảnh và bố cục mẫu trước khi tạo video."><div className="preview-box">{previewPath ? <LocalMedia path={previewPath} video className="preview-video"/> : <div className={`preview-placeholder ${templateNotes[render.template]?.[2] || "scroll"}`}><span>XEM TRƯỚC · 9:16</span><strong>{state.script?.title || state.topic || "CÂU CHUYỆN LỊCH SỬ"}</strong><small>{transitionNotes[render.transition]} · {render.subtitle_style === "highlight" ? "Chạy theo từng từ" : render.subtitle_style === "normal" ? "Phụ đề tĩnh" : "Không phụ đề"}</small></div>}</div><button className="secondary" disabled={busy} onClick={preview}><Icon name="play" size={17}/> Dựng video xem thử</button></Card>
             </div>}
-            {step === "finish" && <div className="finish-grid"><Card title={state.video ? "Video đã hoàn thành" : "Sẵn sàng tạo video"} description={state.video ? "Xem và xuất video của bạn." : "Kiểm tra nhanh lựa chọn cuối cùng."}><div className="summary-list"><div><span>Chất liệu</span><strong>{kind === "image" ? "Ảnh" : "Clip"}</strong></div><div><span>Quy trình</span><strong>{mode === "auto" ? "Tự động" : "Thủ công"}</strong></div><div><span>Thời lượng</span><strong>{state.duration} giây</strong></div><div><span>Giọng đọc</span><strong>{catalog.voices?.[state.voice] || state.voice}</strong></div><div><span>Template</span><strong>{catalog.templates?.[render.template] || render.template}</strong></div><div><span>Chuyển cảnh</span><strong>{transitionNotes[render.transition]}</strong></div><div><span>Phụ đề</span><strong>{catalog.subtitle_styles?.[render.subtitle_style] || render.subtitle_style}</strong></div></div>{state.video ? <div className="button-row"><button className="primary" onClick={exportVideo}><Icon name="upload" size={17}/> Xuất MP4</button><button className="secondary" onClick={() => window.kv?.openPath(directory)}><Icon name="folder" size={17}/> Mở thư mục</button><button className="secondary" disabled={busy} onClick={generate}><Icon name="refresh" size={17}/>{"D\u1ef1ng l\u1ea1i"}</button>{kind === "clip" && <button className="secondary" onClick={copyCredits}><Icon name="link" size={17}/>{"Copy ghi ngu\u1ed3n"}</button>}</div> : <button className="primary generate-button" disabled={busy} onClick={generate}><Icon name="play" size={19}/> Tạo video</button>}</Card><div className="result-preview">{state.video ? <LocalMedia path={state.video} video className="result-video"/> : <div className={`result-placeholder ${templateNotes[render.template]?.[2] || "scroll"}`}><span>KNOWLEDGEVIDEO</span><strong>{state.script?.title || state.topic || "Video của bạn"}</strong><span>9:16 · {render.resolution}</span></div>}</div></div>}
+            {step === "finish" && <div className="finish-grid"><Card title={state.video ? "Video đã hoàn thành" : "Sẵn sàng tạo video"} description={state.video ? "Xem và xuất video của bạn." : "Kiểm tra nhanh lựa chọn cuối cùng."}><div className="summary-list"><div><span>Chất liệu</span><strong>{kind === "image" ? "Ảnh" : "Clip"}</strong></div><div><span>Quy trình</span><strong>{mode === "auto" ? "Tự động" : "Thủ công"}</strong></div><div><span>Thời lượng</span><strong>{state.duration} giây</strong></div><div><span>Giọng đọc</span><strong>{catalog.voices?.[state.voice] || state.voice}</strong></div><div><span>Template</span><strong>{catalog.templates?.[render.template] || render.template}</strong></div><div><span>Chuyển cảnh</span><strong>{transitionNotes[render.transition]}</strong></div><div><span>Phụ đề</span><strong>{catalog.subtitle_styles?.[render.subtitle_style] || render.subtitle_style}</strong></div></div>{state.video ? <div className="button-row"><button className="primary" onClick={exportVideo}><Icon name="upload" size={17}/> Xuất MP4</button><button className="secondary" onClick={() => window.kv?.openPath(directory)}><Icon name="folder" size={17}/> Mở thư mục</button><button className="secondary" disabled={busy} onClick={generate}><Icon name="refresh" size={17}/>{"Dựng lại"}</button>{kind === "clip" && <button className="secondary" onClick={copyCredits}><Icon name="link" size={17}/>{"Copy ghi nguồn"}</button>}</div> : <button className="primary generate-button" disabled={busy} onClick={generate}><Icon name="play" size={19}/> Tạo video</button>}</Card><div className="result-preview">{state.video ? <LocalMedia path={state.video} video className="result-video"/> : <div className={`result-placeholder ${templateNotes[render.template]?.[2] || "scroll"}`}><span>KNOWLEDGEVIDEO</span><strong>{state.script?.title || state.topic || "Video của bạn"}</strong><span>9:16 · {render.resolution}</span></div>}</div></div>}
             {step !== "finish" && <div className="workflow-footer"><button className="secondary" disabled={busy || stepIndex === 0} onClick={() => setStepIndex(i => Math.max(0, i - 1))}><Icon name="back" size={16}/> Quay lại</button><span>{directory ? "Dự án đã lưu trong output" : "Bạn có thể điều chỉnh ở bước tiếp theo"}</span><button className="primary" disabled={busy} onClick={step === "content" ? nextContent : step === "topic" ? chooseTopic : step === "script" ? nextScript : step === "scenes" ? nextScenes : step === "look" ? goToFinish : () => setStepIndex(i => i + 1)}>Tiếp tục <Icon name="arrow" size={17}/></button></div>}
           </>}
         </>}
@@ -468,8 +621,8 @@ export default function Home() {
         {tab === "settings" && <><div className="page-heading"><div className="eyebrow">THIẾT LẬP ỨNG DỤNG</div><h1>Cài đặt</h1><p>AI, nơi lưu video và công cụ dựng trên máy này.</p></div><div className="stack"><Card title="AI & tích hợp"><div className="form-grid settings-grid">{settingFields.slice(0, 10).map(([key, label, type]) => <Field label={label} key={key}><input type={type} value={settings[key] || ""} onChange={e => setSettings(previous => ({ ...previous, [key]: e.target.value }))}/></Field>)}</div></Card><Card title="Lưu trữ & video"><div className="form-grid settings-grid">{settingFields.slice(10).map(([key, label, type]) => <Field label={label} key={key}><div className="input-action"><input type={type} value={settings[key] || ""} onChange={e => setSettings(previous => ({ ...previous, [key]: e.target.value }))}/>{["KV_OUTPUT_DIR", "KV_VIDEO_FONT"].includes(key) && <button onClick={() => (key === "KV_OUTPUT_DIR" ? window.kv?.chooseFolder() : window.kv?.chooseFile("font"))?.then(value => value && setSettings(previous => ({ ...previous, [key]: value })))}><Icon name="folder" size={16}/></button>}</div></Field>)}</div><div className="settings-actions"><span>Cache clip: {cacheMb} MB · Output: {outputDir}</span><button className="secondary" disabled={busy} onClick={() => work("Dọn cache", async () => { const data = await call<Data>("clear_cache"); setCacheMb(data.cache_mb); })}>Dọn cache clip</button><button className="primary" disabled={busy} onClick={() => work("Lưu cài đặt", async () => { const data = await call<Data>("save_settings", { values: settings }); setSettings(data.settings); setOutputDir(data.output_dir); setNotice("Đã lưu cài đặt."); })}>Lưu cài đặt</button></div></Card></div></>}
       </div></div>
       {failure && <div className="error-toast" role="alert"><span className="error-toast-icon">!</span><div><strong>{failure.title} không thành công</strong><p>{failure.text}</p><div className="error-toast-actions"><button onClick={() => { setLogOpen(true); setFailure(null); }}>Xem nhật ký</button><button onClick={() => window.kv?.copyText(`${failure.title}: ${failure.text}`)}>Sao chép</button></div></div><button className="error-toast-close" aria-label="Đóng" onClick={() => setFailure(null)}>×</button></div>}
-      {logOpen && <section className="log-panel" aria-label="Nhật ký">
-        <header><div><strong>Nhật ký</strong><span>{logs.length} dòng{errorCount ? ` · ${errorCount} lỗi` : ""}{warnCount ? ` · ${warnCount} cảnh báo` : ""}</span></div><div className="log-actions"><button disabled={!logs.length} onClick={() => window.kv?.copyText(logs.map(l => `${clock(l.time)} [${logLabels[l.kind]}] ${l.text}${l.percent >= 0 ? ` (${l.percent}%)` : ""}`).join("\n"))}>Sao chép</button><button disabled={!logs.length} onClick={() => setLogs([])}>Xóa</button><button aria-label="Đóng nhật ký" onClick={() => setLogOpen(false)}>×</button></div></header>
+      {logOpen && <section ref={logPanel} className="log-panel" aria-label="Nhật ký" style={logPos ? { left: logPos.x, top: logPos.y, right: "auto", bottom: "auto" } : undefined}>
+        <header onPointerDown={dragLog} onDoubleClick={event => { if (!(event.target as HTMLElement).closest("button")) setLogPos(null); }} title="Kéo để di chuyển · nhấp đúp để về chỗ cũ"><div><strong>Nhật ký</strong><span>{logs.length} dòng{errorCount ? ` · ${errorCount} lỗi` : ""}{warnCount ? ` · ${warnCount} cảnh báo` : ""}</span></div><div className="log-actions"><button disabled={!logs.length} onClick={() => window.kv?.copyText(logs.map(l => `${clock(l.time)} [${logLabels[l.kind]}] ${l.text}${l.percent >= 0 ? ` (${l.percent}%)` : ""}`).join("\n"))}>Sao chép</button><button disabled={!logs.length} onClick={() => setLogs([])}>Xóa</button><button aria-label="Đóng nhật ký" onClick={() => setLogOpen(false)}>×</button></div></header>
         <div className="log-list">{logs.length ? logs.map(entry => <div key={entry.id} className={`log-row ${entry.kind}`}><time>{clock(entry.time)}</time><span className="log-kind">{logLabels[entry.kind]}</span><p>{entry.text}</p>{entry.kind === "progress" && entry.percent >= 0 && <span className="log-percent">{entry.percent}%</span>}</div>) : <p className="log-empty">Chưa có hoạt động nào. Các bước, cảnh báo và lỗi sẽ hiện ở đây.</p>}<div ref={logEnd}/></div>
       </section>}
       {busy && <div className="busy-bar"><div className="busy-progress" style={{ width: percent >= 0 ? `${Math.max(3, percent)}%` : "35%" }}/><span>{status || "Đang xử lý"}</span>{percent >= 0 && <strong>{percent}%</strong>}<button onClick={() => window.kv?.cancel()}>Hủy</button></div>}
